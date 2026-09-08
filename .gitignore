@@ -1,0 +1,30 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Generated builds, smoke runs, and job workspaces
+dist/
+test_*_dist/
+web_jobs/
+web_*_smoke/
+
+# OCR models and source/test media (large or derived)
+tessdata/
+*.pdf
+
+# Benchmarks, logs, and generated metadata
+benchmark_results.json
+run_err.log
+extracted_page16.json
+*.log
+
+# Local tooling / editor files
+.vscode/
+.idea/
+*.localweb_*_smoke*/
+test_fixtures/
+web_*_smoke*/
+test_fixtures/
