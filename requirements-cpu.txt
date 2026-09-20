@@ -1,0 +1,3 @@
+# CPU 通用相依性 (跨平台全環境相容)
+-r requirements.txt
+onnxruntime>=1.17.0

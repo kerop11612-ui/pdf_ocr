@@ -1,30 +1,29 @@
-# Task: 重構極致日文排版還原與字元精度增強系統 (UI 與核心管線)
+# Task: AuraDoc UI/UX 專業級設計系統升級 (基於 ui-ux-pro-max)
 
 ## 目標
-徹底摒棄原圖截圖、題庫配對與 RAG 向量切塊等次要包袱，將系統 100% 聚焦於：
-1. **排版還原 (Layout Preservation)**：
-   - 雙欄與多欄智慧偵測切分 (XY-Cut Column Split)，根除左右穿插問題。
-   - 標點符號感知自然重組成句 (Sentence Reflow Engine)，消除 OCR 破碎硬換行。
-   - 振假名 (Ruby) 幾何過濾/降噪，保護主句法結構。
-   - 頂底邊界保護罩 (Margin Crop)，去除頁首頁尾雜訊。
-2. **精準度提升 (Accuracy Boost)**：
-   - CLAHE 影像自適應對比增強，防止假名濁點 (゛/゜) 遺失與底灰透字。
-   - 語境約束的同形異義字自動校正 (長音符號 ー、カ/力、ロ/口、ニ/二)。
-   - 數字與日文字元黏字解耦 (如 `14次の文` -> `14 次の文`)。
-3. **UI 簡約高對比重構 (ui-ux-pro-max)**：
-   - 左右直觀對比：乾淨排版 Markdown 預覽 vs 原始 OCR 文本預覽。
-   - 實時精準度報告：顯示同形字校準次數、黏字修復數、雙欄偵測狀態與 FPS。
-   - 精簡下載：一鍵導出乾淨版 `.md`、原始純文字 `.txt` 與排版指標 `.json`。
+全面導入 ui-ux-pro-max 設計規範（Slate Dark Pro + OLED 對比度），消除 Emoji 反模式、實作原圖畫布 Pan & Zoom、Minimap 圖例強化、快速鍵速查面板與平滑微互動。
+
+## 實作項目
+- [x] Phase A: 全面消除 Emoji，導入標準 Lucide 向量 SVG 圖示
+  - [x] 替換工作台按鈕（標記確認、待確認跳轉、上一頁、下一頁、編輯、重跑、下載）
+  - [x] 替換狀態 Badge 與 Toast 通知圖示
+- [x] Phase B: 原圖畫布平移縮放引擎 (Pan & Zoom Canvas)
+  - [x] 於原圖工具列加入縮放控制器（放大、縮小、100%、適應寬度）
+  - [x] 實作滑鼠滾輪縮放、按住左/中鍵拖曳平移
+  - [x] 確保底圖 PNG 與頂層 SVG 向量框變換矩陣完全同步
+- [x] Phase C: Minimap 圖例說明與 Rich Tooltip
+  - [x] 頂部加入微型圖例標籤（已確認綠、待確認紅、普通深藍）
+  - [x] 強化懸停摘要提示
+- [x] Phase D: 快速鍵速查面板 (Keyboard Shortcuts Cheat Sheet Modal)
+  - [x] 頂部工具列加入 `?` 按鈕，支援按下 `?` 或點擊開啟 Modal
+  - [x] 結構化語意 `<kbd>` 按鍵展示
+- [x] Phase E: Slate Dark Pro 設計系統與微互動樣式
+  - [x] 導入 Plus Jakarta Sans 與 JetBrains Mono
+  - [x] 調整色系為 OLED Slate Dark（#080D1A / #0F172A / #1E293B）
+  - [x] 統一過渡時間為 180ms ease，避免任何 layout shift
 
 ## 目標檔案
-- `textbook_layout.py` [NEW]: 排版引擎 (XY-Cut 雙欄排序、句末標點融合成段、振假名清洗) 與精度引擎 (CLAHE 前處理、日文同形字/黏字校正)。(已完成)
-- `directml_pipeline.py` [MODIFY]: 整合 `textbook_layout.py`，專注產出乾淨排版文字與原始純文字。(已完成)
-- `app.py` [MODIFY]: 重構 UI 面板，加入排版/精度切換開關，提供排版後與原始文字雙視圖對比。(已上線)
-- `test_textbook_layout.py` [NEW]: 單元測試驗證通過。(Exit Code 0)
-- `test_layout_e2e.py` [NEW]: 端到端整合測試驗證通過。(Exit Code 0)
-- `task.md` [MODIFY]: 進度追蹤與成果紀錄。(已更新)
-
-## 實測成果
-- `test_textbook_layout.py`：單元測試驗證 CLAHE 影像微對比增強、同形字（長音、カ/力、ロ/口、ニ/二）9 處校準、XY-Cut 雙欄分割以及句末標點自然連貫成段，全部通過。
-- `test_layout_e2e.py`：端到端整合測試驗證完成，生成乾淨排版筆記、原始對照純文字與指標 JSON。
-- 服務現正運行中：`http://127.0.0.1:7860` (HTTP 200 OK)。
+- `static/index.html` [MODIFY]
+- `static/app.css` [MODIFY]
+- `static/app.js` [MODIFY]
+- `tests/test_web_app.py` [MODIFY]

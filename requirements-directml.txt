@@ -1,0 +1,3 @@
+# Windows DirectML GPU 加速相依性 (支援 AMD / Intel / NVIDIA 顯示卡)
+-r requirements.txt
+onnxruntime-directml>=1.17.0

@@ -1,12 +1,21 @@
-ocrmypdf>=16.0.0
-pypdf>=4.0.0
-pymupdf>=1.23.0
-tqdm>=4.66.0
-transformers>=4.38.0
-sentencepiece>=0.2.0
-docling>=2.0.0
-docling-core>=2.0.0
+# AuraDoc 核心相依套件 (通用無鎖定 ONNX Runtime 版本)
+# 請依據硬體使用 setup_env.py 或搭配 requirements-cuda.txt / requirements-directml.txt 安裝
 
-fastapi==0.141.1
-uvicorn==0.49.0
-python-multipart
+# Web 介面與服務
+fastapi>=0.110.0
+uvicorn>=0.28.0
+python-multipart>=0.0.9
+
+# PDF 解析與影像處理
+pymupdf>=1.23.0
+pypdf>=4.0.0
+numpy>=1.24.0
+opencv-python-headless>=4.8.0
+
+# OCR 辨識引擎
+rapidocr>=3.0.0
+tqdm>=4.66.0
+
+# 測試套件 (選用)
+pytest>=8.0.0
+httpx>=0.27.0

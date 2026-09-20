@@ -1,9 +1,371 @@
-<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AuraDoc OCR Local</title><link rel="stylesheet" href="/static/app.css"></head><body>
-<main><header><p class="eyebrow">LOCAL OCR WORKSPACE</p><h1>AuraDoc OCR</h1><p>PDF 教材排版還原與原始 OCR 對照</p></header>
-<section class="grid"><form id="job-form" class="card" aria-label="建立 OCR 工作"><h2>建立工作</h2><label>PDF 檔案<input id="file" name="file" type="file" accept="application/pdf" required></label><p id="hardware" class="muted" role="status">正在讀取本機硬體資訊…</p><details class="hardware-details"><summary>執行 provider 詳情</summary><pre id="provider-details"></pre></details><p id="file-info" class="muted" role="status">選擇 PDF 後會驗證頁數。</p>
-<fieldset><legend>處理範圍</legend><label><input type="radio" name="range_mode" value="first5" checked> 前 5 頁</label><label><input type="radio" name="range_mode" value="all"> 全書</label><label><input type="radio" name="range_mode" value="custom"> 自訂</label><div class="range"><label>起頁<input name="start_page" type="number" min="1" value="1"></label><label>迄頁<input name="end_page" type="number" min="1" value="5"></label></div></fieldset>
-<fieldset><legend>運算裝置</legend><label><input type="radio" name="backend" value="auto" checked> Auto（GPU 失敗時改用 CPU）</label><label><input type="radio" name="backend" value="gpu"> GPU（失敗即回報）</label><label><input type="radio" name="backend" value="cpu"> CPU</label></fieldset>
-<details><summary>進階設定</summary><label><input name="adaptive_retry" type="checkbox" checked> 低信心 DPI 重試</label><label><input name="clahe" type="checkbox" checked> CLAHE 對比增強</label><label><input name="reflow" type="checkbox" checked> 句子重組</label><label><input name="two_column" type="checkbox" checked> 雙欄偵測</label><label><input name="furigana" type="checkbox" checked> 振假名降噪</label><label><input name="homoglyphs" type="checkbox" checked> 同形字校正</label></details>
-<button type="submit">排入 OCR 佇列</button></form>
-<section class="card result" aria-live="polite"><div class="result-head"><div><p class="eyebrow">工作狀態</p><h2 id="title">尚未建立工作</h2></div><button id="cancel" class="secondary" disabled>取消工作</button></div><p id="status">上傳 PDF 後，會建立可在重整頁面後查詢的 UUID 工作紀錄。</p><progress id="progress" max="100" value="0">0%</progress><p id="telemetry" class="muted">實際 OCR provider 將在處理完成後顯示。</p><div class="downloads" id="downloads" hidden><a data-kind="clean">下載 Clean Markdown</a><a data-kind="raw">下載 Raw Text</a><a data-kind="metrics">下載 Metrics JSON</a></div></section></section>
-<section id="history" class="card" aria-label="最近工作"><h2>最近工作</h2><div id="history-list" class="history-list"></div></section><section id="compare" class="compare" hidden><div class="page-nav"><button id="prev-page" class="secondary">上一頁</button><span id="page-label">第 1 頁</span><button id="next-page" class="secondary">下一頁</button></div><article class="card"><h2>原 PDF 頁面</h2><img id="original" alt="原始 PDF 頁面預覽"></article><article class="card"><h2>Clean Markdown</h2><pre id="clean"></pre></article><article class="card"><h2>Raw OCR</h2><pre id="raw"></pre></article></section></main><script src="/static/app.js"></script></body></html>
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AuraDoc OCR 校對工作台</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="app-header">
+    <div class="header-inner">
+      <div class="brand">
+        <p class="eyebrow">AURA DOC · PROOFREADING WORKSPACE</p>
+        <h1>AuraDoc 校對工作台</h1>
+      </div>
+      <div id="hardware-badge" class="hardware-badge" title="硬體偵測狀態">硬體讀取中…</div>
+    </div>
+  </header>
+
+  <main>
+    <!-- 1. 工作建立與進階設定區塊 -->
+    <section class="grid-top">
+      <form id="job-form" class="card form-card" aria-label="建立 OCR 工作">
+        <div class="card-head">
+          <h2>建立 OCR 工作</h2>
+          <span id="file-info" class="file-tag muted">請選擇 PDF 檔案</span>
+        </div>
+        
+        <label class="drop-zone">
+          <span class="drop-label">點擊或選擇 PDF 檔案</span>
+          <input id="file" name="file" type="file" accept="application/pdf" required>
+        </label>
+
+        <!-- 模式切換 -->
+        <div class="mode-select-group">
+          <span class="group-label">處理情境模式</span>
+          <div class="preset-options">
+            <label class="preset-card">
+              <input type="radio" name="preset_mode" value="preview" checked>
+              <div class="preset-content">
+                <strong>快速預覽</strong>
+                <small>前 5 頁 · 快速驗證品質</small>
+              </div>
+            </label>
+            <label class="preset-card">
+              <input type="radio" name="preset_mode" value="textbook">
+              <div class="preset-content">
+                <strong>教材整理</strong>
+                <small>全書 · 完整雙欄與同形字增強</small>
+              </div>
+            </label>
+            <label class="preset-card">
+              <input type="radio" name="preset_mode" value="questions">
+              <div class="preset-content">
+                <strong>題庫精準</strong>
+                <small>全書 · 保護題號與選項排版</small>
+              </div>
+            </label>
+            <label class="preset-card">
+              <input type="radio" name="preset_mode" value="custom">
+              <div class="preset-content">
+                <strong>自訂範圍</strong>
+                <small>指定頁碼區間</small>
+              </div>
+            </label>
+          </div>
+        </div>
+
+        <!-- 隱藏但相容既有 API 的 range_mode -->
+        <input type="hidden" name="range_mode" id="range_mode" value="first5">
+
+        <!-- 條件式展開的頁碼設定 -->
+        <div id="custom-range-box" class="range-box" hidden>
+          <div class="range-inputs">
+            <label>起頁<input name="start_page" id="start_page" type="number" min="1" value="1"></label>
+            <label>迄頁<input name="end_page" id="end_page" type="number" min="1" value="5"></label>
+          </div>
+        </div>
+
+        <!-- 進階設定收合 -->
+        <details class="advanced-details">
+          <summary>進階參數與硬體設定</summary>
+          <div class="advanced-content">
+            <fieldset>
+              <legend>運算裝置</legend>
+              <div class="radio-row">
+                <label><input type="radio" name="backend" value="auto" checked> Auto（優先 GPU）</label>
+                <label><input type="radio" name="backend" value="gpu"> GPU（DirectML）</label>
+                <label><input type="radio" name="backend" value="cpu"> CPU</label>
+              </div>
+            </fieldset>
+            <fieldset>
+              <legend>排版與校正引擎</legend>
+              <div class="check-grid">
+                <label><input name="adaptive_retry" type="checkbox" checked> 低信心 DPI 重試</label>
+                <label><input name="clahe" type="checkbox" checked> CLAHE 對比增強</label>
+                <label><input name="reflow" type="checkbox" checked> 標點感知成句</label>
+                <label><input name="two_column" type="checkbox" checked> XY-Cut 雙欄切分</label>
+                <label><input name="furigana" type="checkbox" checked> 振假名幾何降噪</label>
+                <label><input name="homoglyphs" type="checkbox" checked> 日文同形字校正</label>
+              </div>
+            </fieldset>
+            <p id="hardware-desc" class="muted hardware-desc"></p>
+          </div>
+        </details>
+
+        <button type="submit" id="submit-btn" class="primary-btn">排入 OCR 佇列</button>
+      </form>
+
+      <!-- 2. 目前工作狀態與摘要區 -->
+      <section class="card status-card" aria-live="polite">
+        <div class="status-header">
+          <div>
+            <span class="eyebrow" id="job-status-badge">等待工作</span>
+            <h2 id="job-title" class="job-title">尚未建立工作</h2>
+          </div>
+          <button id="cancel-btn" class="secondary-btn" disabled>取消工作</button>
+        </div>
+
+        <!-- 流程階段條 -->
+        <div class="pipeline-stages" id="pipeline-stages">
+          <span class="stage" data-stage="ready">上傳完成</span>
+          <span class="stage-arrow">→</span>
+          <span class="stage" data-stage="init">初始化模型</span>
+          <span class="stage-arrow">→</span>
+          <span class="stage" data-stage="ocr">OCR 辨識</span>
+          <span class="stage-arrow">→</span>
+          <span class="stage" data-stage="layout">排版整理</span>
+          <span class="stage-arrow">→</span>
+          <span class="stage" data-stage="done">建立輸出</span>
+        </div>
+
+        <p id="status-msg" class="status-msg">上傳 PDF 後，將自動建立可供中斷與恢復的工作紀錄。</p>
+        <div class="progress-bar-wrap">
+          <progress id="progress" max="100" value="0">0%</progress>
+          <span id="progress-percent">0%</span>
+        </div>
+
+        <div id="job-metrics-summary" class="metrics-summary">
+          <div class="metric-pill"><span>完成進度</span><strong id="metric-pages">-</strong></div>
+          <div class="metric-pill"><span>待確認頁</span><strong id="metric-review-count" class="badge-review">-</strong></div>
+          <div class="metric-pill"><span>運算裝置</span><strong id="metric-backend">-</strong></div>
+        </div>
+
+        <!-- 輸出下載區 -->
+        <div class="download-section" id="download-section" hidden>
+          <div class="download-primary">
+            <a id="btn-download-clean" class="btn-primary-action" data-kind="clean">下載整理版 (Clean Markdown)</a>
+          </div>
+          <details class="more-downloads">
+            <summary>其他格式匯出與報表</summary>
+            <div class="download-grid">
+              <a data-kind="raw" class="download-chip">
+                <strong>原始 OCR 文本 (.txt)</strong>
+                <small>完全無排版加工的識別純文字</small>
+              </a>
+              <a data-kind="clean_reviewed" class="download-chip">
+                <strong>僅已確認頁面 (.md)</strong>
+                <small>排除雜訊與待審核頁面的純淨文字</small>
+              </a>
+              <a data-kind="review_pending" class="download-chip">
+                <strong>僅待確認頁面 (.md)</strong>
+                <small>抽離問題頁面集中人工覆核</small>
+              </a>
+              <a data-kind="obsidian" class="download-chip">
+                <strong>Obsidian 筆記 (.md)</strong>
+                <small>含 Frontmatter 標籤與 YAML 元資料</small>
+              </a>
+              <a data-kind="structured" class="download-chip">
+                <strong>結構化數據 (.jsonl)</strong>
+                <small>含每行座標 bbox、信心度與分塊結構</small>
+              </a>
+              <a data-kind="metrics" class="download-chip">
+                <strong>品質指標報表 (.json)</strong>
+                <small>耗時統計、同形字修正與雙欄分佈</small>
+              </a>
+            </div>
+          </details>
+        </div>
+      </section>
+    </section>
+
+    <!-- 3. 校對工作台 (Workbench) -->
+    <section id="workbench" class="workbench-section" hidden>
+      <!-- 工作台頂部導覽列 (Sticky) -->
+      <div class="workbench-toolbar">
+        <div class="nav-controls">
+          <button id="prev-page" class="nav-btn" title="快速鍵: ← 上一頁">
+            <svg class="ui-icon" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></svg>
+            上一頁
+          </button>
+          <div class="page-indicator">
+            <span id="page-label" class="page-num">第 1 頁</span>
+            <span id="page-type-badge" class="type-badge">文章</span>
+          </div>
+          <button id="next-page" class="nav-btn" title="快速鍵: → 下一頁">
+            下一頁
+            <svg class="ui-icon" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg>
+          </button>
+          <div class="page-jump">
+            <label for="page-jump-input">跳至</label>
+            <input type="number" id="page-jump-input" min="1" class="page-jump-input" placeholder="頁碼">
+          </div>
+        </div>
+
+        <div class="review-status-bar">
+          <div id="review-reasons-container" class="review-reasons-wrap"></div>
+          <button id="btn-toggle-reviewed" class="action-btn success-btn" title="快速鍵: Space">
+            <svg class="ui-icon" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg>
+            <span id="label-toggle-reviewed">標記已確認 (Space)</span>
+          </button>
+          <button id="jump-next-review" class="action-btn warning-btn" title="快速鍵: J">
+            <svg class="ui-icon" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+            下一個待確認頁 (J)
+          </button>
+        </div>
+
+        <div class="filter-controls">
+          <span class="filter-label">篩選：</span>
+          <select id="page-filter" class="filter-select">
+            <option value="all">全部頁面</option>
+            <option value="review">僅待確認頁</option>
+            <option value="prose">文章</option>
+            <option value="questions">題目</option>
+            <option value="vocabulary_cards">單字卡</option>
+            <option value="toc">目錄</option>
+            <option value="decorative_or_blank">空白/裝飾</option>
+          </select>
+          <button id="btn-shortcuts-help" class="icon-btn text-btn" title="快捷鍵指南 (?)">
+            <svg class="ui-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- 全頁面狀態地圖 (Minimap) -->
+      <div class="minimap-wrapper card">
+        <div class="minimap-header">
+          <div class="minimap-title-wrap">
+            <span class="minimap-title">頁面全覽地圖（點擊直達）</span>
+            <div class="minimap-legend">
+              <span class="legend-chip"><span class="legend-dot dot-reviewed"></span>已確認</span>
+              <span class="legend-chip"><span class="legend-dot dot-needs-review"></span>待確認</span>
+              <span class="legend-chip"><span class="legend-dot dot-normal"></span>一般頁</span>
+            </div>
+          </div>
+          <span id="minimap-stats" class="minimap-stats">已確認進度計算中…</span>
+        </div>
+        <div id="page-minimap" class="page-minimap"></div>
+      </div>
+
+      <!-- 45% / 55% 對照主體 -->
+      <div class="workbench-split">
+        <!-- 左側 45%：原圖 + 向量文字框疊加 -->
+        <article class="split-left card">
+          <div class="card-mini-head">
+            <h3>原 PDF 頁面</h3>
+            <div class="head-actions">
+              <!-- Zoom & Pan Controls -->
+              <div class="zoom-controls">
+                <button id="btn-zoom-out" class="icon-btn" title="縮小 (滾輪向下)">
+                  <svg class="ui-icon" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="8" y1="11" x2="14" y2="11"/></svg>
+                </button>
+                <span id="zoom-level" class="zoom-indicator">100%</span>
+                <button id="btn-zoom-in" class="icon-btn" title="放大 (滾輪向上)">
+                  <svg class="ui-icon" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg>
+                </button>
+                <button id="btn-zoom-reset" class="small-btn text-btn" title="重設為原始大小">1:1</button>
+                <button id="btn-zoom-fit" class="small-btn text-btn" title="適應視窗寬度">Fit</button>
+              </div>
+              <label class="toggle-label" title="切換原圖上的辨識框線">
+                <input type="checkbox" id="toggle-overlay" checked> 標註框
+              </label>
+              <button id="toggle-collapse-img" class="text-btn sm-only">收合原圖</button>
+            </div>
+          </div>
+          <div class="original-viewport" id="original-viewport">
+            <div class="original-container" id="original-container">
+              <img id="original-img" alt="原始 PDF 預覽">
+              <svg id="original-svg" class="overlay-svg"></svg>
+            </div>
+          </div>
+          <!-- 圖例標籤 -->
+          <div class="overlay-legend">
+            <span class="legend-item"><span class="legend-dot dot-clean"></span> 保留文字</span>
+            <span class="legend-item"><span class="legend-dot dot-review"></span> 待確認/低信心</span>
+            <span class="legend-item"><span class="legend-dot dot-filtered"></span> 已濾除 (振假名/頁緣)</span>
+          </div>
+        </article>
+
+        <!-- 右側 55%：頁籤區域 (Clean / Raw / Diff) -->
+        <article class="split-right card">
+          <div class="tabs-header">
+            <div class="tabs-left">
+              <button class="tab-btn active" data-tab="clean">整理結果 (Clean)</button>
+              <button class="tab-btn" data-tab="raw">原始 OCR (Raw)</button>
+              <button class="tab-btn" data-tab="diff">差異比對 (Diff)</button>
+            </div>
+            <div class="tabs-actions">
+              <button id="btn-edit-clean" class="small-btn" title="快速鍵: E">
+                <svg class="ui-icon" viewBox="0 0 24 24"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
+                <span id="label-edit-clean">編輯 (E)</span>
+              </button>
+              <button id="btn-save-clean" class="small-btn primary" hidden>
+                <svg class="ui-icon" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+                儲存修改
+              </button>
+              <button id="btn-rerun-page" class="small-btn secondary" title="重新處理本頁">
+                <svg class="ui-icon" viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg>
+                重跑本頁
+              </button>
+            </div>
+          </div>
+
+          <!-- Clean 內容 -->
+          <div class="tab-pane active" id="pane-clean">
+            <div id="clean-view" class="text-view"></div>
+            <textarea id="clean-editor" class="text-editor" hidden spellcheck="false"></textarea>
+          </div>
+
+          <!-- Raw 內容 -->
+          <div class="tab-pane" id="pane-raw" hidden>
+            <pre id="raw-view" class="raw-pre"></pre>
+          </div>
+
+          <!-- Diff 內容 -->
+          <div class="tab-pane" id="pane-diff" hidden>
+            <div id="diff-view" class="diff-container"></div>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <!-- 4. 最近工作歷史紀錄 -->
+    <section class="card history-card" aria-label="最近工作">
+      <div class="history-head">
+        <h2>最近工作</h2>
+        <div class="history-search">
+          <input type="search" id="history-search" placeholder="搜尋檔名…">
+        </div>
+      </div>
+      <div id="history-list" class="history-grid"></div>
+    </section>
+  </main>
+
+  <!-- 5. 快捷鍵指南浮層 Modal -->
+  <div id="shortcuts-modal" class="modal-backdrop" hidden>
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>校對工作台快捷鍵速查</h3>
+        <button id="modal-close" class="icon-btn" title="關閉 (Esc)">
+          <svg class="ui-icon" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <div class="shortcuts-grid">
+        <div class="shortcut-row"><kbd>Space</kbd><span>標記當前頁為「已確認」，並自動跳轉至下一待確認頁</span></div>
+        <div class="shortcut-row"><kbd>J</kbd><span>直達下一個待確認頁面（低信心度 / 雜訊 / 複雜排版）</span></div>
+        <div class="shortcut-row"><kbd>E</kbd><span>開啟 / 關閉 Clean 整理文字原地編輯器</span></div>
+        <div class="shortcut-row"><kbd>&larr;</kbd><span>切換至上一頁</span></div>
+        <div class="shortcut-row"><kbd>&rarr;</kbd><span>切換至下一頁</span></div>
+        <div class="shortcut-row"><kbd>?</kbd><span>開啟 / 關閉此快捷鍵指南</span></div>
+        <div class="shortcut-row"><kbd>Esc</kbd><span>關閉視窗浮層 / 退出編輯輸入焦點</span></div>
+        <div class="shortcut-row"><kbd>滾輪</kbd><span>在原圖區域滑動滾輪即可即時縮放畫布</span></div>
+        <div class="shortcut-row"><kbd>拖曳</kbd><span>按住滑鼠左鍵可任意平移原圖畫布</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast-container" class="toast-container" aria-live="polite"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

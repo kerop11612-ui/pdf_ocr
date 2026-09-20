@@ -20,6 +20,10 @@ benchmark_results.json
 run_err.log
 extracted_page16.json
 *.log
+preview-*.png
+*.tmp
+output/
+outputs/
 
 # Local tooling / editor files
 .vscode/

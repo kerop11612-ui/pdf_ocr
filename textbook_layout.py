@@ -93,6 +93,113 @@ SENTENCE_TERMINATORS = ("。", "！", "？", "!", "?", "：", "；", "…", "」
 BULLET_PREFIXES = ("・", "①", "②", "③", "④", "⑤", "⑥", "1.", "2.", "3.", "4.", "5.", "(1)", "(2)", "(3)", "◆", "■", "▲", "Q.", "A.")
 HEADING_KEYWORDS = ("第", "課", "文法", "ポイント", "意味", "接續", "接続", "例文", "解説", "注意", "問題", "練習")
 
+
+def _classify_page(items: List[Dict[str, Any]]) -> str:
+    """Classify only the layout modes that need different reconstruction."""
+    if not items:
+        return "decorative_or_blank"
+    texts = [it["text"] for it in items]
+    combined = "\n".join(texts)
+    choice_count = sum(bool(re.match(r"^\s*[1-4１-４](?:[.．、\s]|$)", text)) for text in texts)
+    if choice_count >= 3 or any(token in combined for token in ("選びなさい", "えらびなさい", "隨堂測驗", "随堂測驗", "解答：")):
+        return "questions"
+    vocab_ids = sum(bool(re.search(r"\b[A-Z]?\d{3}-\d{2}\b", text)) for text in texts)
+    if vocab_ids >= 2:
+        return "vocabulary_cards"
+    page_refs = sum(bool(re.search(r"(?:^|\s)p\.?\s*\d{1,3}\b", text, re.I)) for text in texts)
+    unit_labels = sum(bool(re.search(r"\d{1,2}\s*(?:單元|单元)", text)) for text in texts)
+    if page_refs >= 3 or (page_refs >= 2 and unit_labels >= 2):
+        return "toc"
+    return "prose"
+
+
+def _line_review_reasons(text: str, confidence: Optional[float]) -> List[str]:
+    reasons = []
+    if confidence is not None and confidence < 0.70:
+        reasons.append("low_confidence")
+    if any(char in text for char in ("�", "□")):
+        reasons.append("unknown_character")
+    if re.search(r"([\u3040-\u30ff\u3400-\u9fff])\1{3,}", text):
+        reasons.append("repeated_character")
+    if re.search(r"(?<=[\u3040-\u30ff\u3400-\u9fff])<(?=[\u3040-\u30ff\u3400-\u9fff])", text):
+        reasons.append("mixed_symbol")
+    return reasons
+
+
+def _structured_line(item: Dict[str, Any]) -> Dict[str, Any]:
+    reasons = _line_review_reasons(item["text"], item.get("confidence"))
+    line = {
+        "text": item["text"],
+        "raw_text": item["raw_text"],
+        "bbox": [item["x_min"], item["y_min"], item["x_max"], item["y_max"]],
+        "confidence": item.get("confidence"),
+        "needs_review": bool(reasons),
+        "review_reasons": reasons,
+    }
+    if "included_in_clean" in item:
+        line["included_in_clean"] = item["included_in_clean"]
+        line["filter_reason"] = item.get("filter_reason")
+    return line
+
+
+def _make_block(block_type: str, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "type": block_type,
+        "bbox": [
+            min(it["x_min"] for it in items), min(it["y_min"] for it in items),
+            max(it["x_max"] for it in items), max(it["y_max"] for it in items),
+        ],
+        "lines": [_structured_line(it) for it in items],
+    }
+
+
+def _is_heading(item: Dict[str, Any], median_h: float) -> bool:
+    text = item["text"]
+    explicit = text.startswith("【") or bool(re.match(r"^第\s*\d+\s*[課章單元篇]", text))
+    prominent = item["h"] >= median_h * 1.20 and len(text) < 40
+    return explicit or prominent or (len(text) < 20 and text in HEADING_KEYWORDS)
+
+
+def _format_prose_block(items: List[Dict[str, Any]], median_h: float, page_width: float) -> str:
+    paragraphs: List[str] = []
+    current = ""
+    previous = None
+    block_left = min(it["x_min"] for it in items)
+    for item in items:
+        text = item["text"].strip()
+        if not text:
+            continue
+        if _is_heading(item, median_h):
+            if current:
+                paragraphs.append(current)
+                current = ""
+            paragraphs.append(f"### {text}")
+            previous = item
+            continue
+        if any(text.startswith(prefix) for prefix in BULLET_PREFIXES):
+            if current:
+                paragraphs.append(current)
+            current = f"- {text}"
+            previous = item
+            continue
+        if not current:
+            current = text
+        else:
+            gap = item["y_min"] - previous["y_max"] if previous else 0
+            indent = item["x_min"] - block_left
+            paragraph_break = gap > median_h * 1.15 or (
+                current.endswith(SENTENCE_TERMINATORS) and indent > max(median_h * 1.0, page_width * 0.025)
+            )
+            if paragraph_break:
+                paragraphs.append(current)
+                current = text
+            else:
+                current += text
+        previous = item
+    if current:
+        paragraphs.append(current)
+    return "\n\n".join(paragraphs)
+
 def process_page_layout(
     txts: List[str],
     boxes: List[Any],
@@ -101,7 +208,8 @@ def process_page_layout(
     enable_reflow: bool = True,
     enable_two_column: bool = True,
     enable_furigana_filter: bool = True,
-    enable_homoglyphs: bool = True
+    enable_homoglyphs: bool = True,
+    scores: Optional[List[float]] = None
 ) -> Dict[str, Any]:
     """
     Restores natural Japanese layout and reading order.
@@ -111,42 +219,65 @@ def process_page_layout(
         "raw_text": str,
         "corrections_count": int,
         "columns_detected": int,
-        "furigana_filtered": int
+        "furigana_filtered": int,
+        "page_type": str,
+        "blocks": list,
+        "needs_review": bool,
+        "review_reasons": list,
+        "source_lines": list
     }
     """
     # Preserve engine order and whitespace before all cleanup and geometry filters.
     raw_text = "\n".join(txts)
     if len(txts) == 0 or len(boxes) == 0:
+        source_lines = [{
+            "text": text.strip(), "raw_text": text, "bbox": None,
+            "confidence": float(scores[i]) if scores is not None and i < len(scores) else None,
+            "needs_review": True, "review_reasons": ["missing_geometry"],
+            "included_in_clean": False, "filter_reason": "missing_geometry",
+        } for i, text in enumerate(txts)]
         return {
             "clean_text": "",
             "raw_text": raw_text,
             "corrections_count": 0,
             "columns_detected": 1,
-            "furigana_filtered": 0
+            "furigana_filtered": 0,
+            "page_type": "decorative_or_blank",
+            "blocks": [],
+            "needs_review": bool(source_lines),
+            "review_reasons": ["missing_geometry"] if source_lines else [],
+            "source_lines": source_lines,
         }
 
     total_corrections = 0
     items = []
+    source_line_records: List[Optional[Dict[str, Any]]] = [None] * len(txts)
 
     # 1. Parse boxes & compute geometry
     for i, t in enumerate(txts):
-        raw_t = t.strip()
-        if not raw_t:
-            continue
-        corr_t, n_corr = correct_homoglyphs_and_boundaries(raw_t) if enable_homoglyphs else (raw_t, 0)
+        stripped_t = t.strip()
+        corr_t, n_corr = correct_homoglyphs_and_boundaries(stripped_t) if enable_homoglyphs else (stripped_t, 0)
         total_corrections += n_corr
 
-        b = boxes[i] if i < len(boxes) else [[0, 0], [0, 0], [0, 0], [0, 0]]
-        x_min = min(pt[0] for pt in b)
-        x_max = max(pt[0] for pt in b)
-        y_min = min(pt[1] for pt in b)
-        y_max = max(pt[1] for pt in b)
+        if i >= len(boxes) or boxes[i] is None or len(boxes[i]) == 0:
+            source_line_records[i] = {
+                "text": corr_t, "raw_text": t, "bbox": None,
+                "confidence": float(scores[i]) if scores is not None and i < len(scores) else None,
+                "needs_review": True, "review_reasons": ["missing_geometry"],
+                "included_in_clean": False, "filter_reason": "missing_geometry",
+            }
+            continue
+        b = boxes[i]
+        x_min = float(min(pt[0] for pt in b))
+        x_max = float(max(pt[0] for pt in b))
+        y_min = float(min(pt[1] for pt in b))
+        y_max = float(max(pt[1] for pt in b))
         w = max(1.0, x_max - x_min)
         h = max(1.0, y_max - y_min)
 
         items.append({
             "text": corr_t,
-            "raw_text": raw_t,
+            "raw_text": t,
             "x_min": x_min,
             "x_max": x_max,
             "y_min": y_min,
@@ -154,29 +285,46 @@ def process_page_layout(
             "w": w,
             "h": h,
             "x_center": (x_min + x_max) / 2.0,
-            "y_center": (y_min + y_max) / 2.0
+            "y_center": (y_min + y_max) / 2.0,
+            "confidence": float(scores[i]) if scores is not None and i < len(scores) else None,
+            "included_in_clean": bool(stripped_t),
+            "filter_reason": None if stripped_t else "empty_text",
+            "source_index": i,
         })
 
     if not items:
+        source_lines = [line for line in source_line_records if line is not None]
+        review_reasons = sorted({reason for line in source_lines for reason in line["review_reasons"]})
         return {
             "clean_text": "",
             "raw_text": raw_text,
             "corrections_count": 0,
             "columns_detected": 1,
-            "furigana_filtered": 0
+            "furigana_filtered": 0,
+            "page_type": "decorative_or_blank",
+            "blocks": [],
+            "needs_review": bool(review_reasons),
+            "review_reasons": review_reasons,
+            "source_lines": source_lines,
         }
 
     # 2. Margin Crop (Filter top 4% and bottom 4% noise)
     valid_items = []
     for it in items:
+        if not it["included_in_clean"]:
+            continue
         # Header noise check
         if it["y_min"] < page_height * 0.04:
             # Keep only if explicitly a grammar header
             if not any(k in it["text"] for k in HEADING_KEYWORDS):
+                it["included_in_clean"] = False
+                it["filter_reason"] = "top_margin"
                 continue
         # Footer noise check (isolated digits / publisher info)
         if it["y_max"] > page_height * 0.96:
             if re.match(r"^\d{1,3}$", it["text"]):
+                it["included_in_clean"] = False
+                it["filter_reason"] = "footer_page_number"
                 continue
         valid_items.append(it)
 
@@ -192,15 +340,22 @@ def process_page_layout(
             is_all_kana = bool(re.match(r"^[\u3040-\u30FF\s]+$", it["text"]))
             if is_tiny and is_all_kana:
                 furigana_count += 1
+                it["included_in_clean"] = False
+                it["filter_reason"] = "furigana"
                 continue  # Filter out ruby line to prevent sentence rupture
             non_furigana_items.append(it)
     else:
         non_furigana_items = valid_items
 
-    # 4. Multi-Column (XY-Cut) Detection
+    # 4. Page type and coarse region blocks
+    page_type = _classify_page(non_furigana_items)
+
+    # 5. Multi-Column (XY-Cut) Detection
     # Determine if text is formatted as 2 columns
     columns_detected = 1
     sorted_items = []
+    median_h = float(np.median([it["h"] for it in non_furigana_items])) if non_furigana_items else 15.0
+    block_groups: List[Tuple[str, List[Dict[str, Any]]]] = []
 
     if enable_two_column and len(non_furigana_items) >= 4:
         mid_x = page_width / 2.0
@@ -227,14 +382,43 @@ def process_page_layout(
             # Sort right column top to bottom
             right_col.sort(key=lambda x: (round(x["y_min"] / 12) * 12, x["x_min"]))
             
-            # Place top headers, then left column, then right column
-            sorted_items = spanning_headers + left_col + right_col
+            remaining_left = list(left_col)
+            remaining_right = list(right_col)
+            for spanning in spanning_headers:
+                band_left = [it for it in remaining_left if it["y_center"] < spanning["y_min"]]
+                band_right = [it for it in remaining_right if it["y_center"] < spanning["y_min"]]
+                if band_left:
+                    block_groups.append(("column", band_left))
+                if band_right:
+                    block_groups.append(("column", band_right))
+                remaining_left = [it for it in remaining_left if it not in band_left]
+                remaining_right = [it for it in remaining_right if it not in band_right]
+                block_groups.append(("heading" if _is_heading(spanning, median_h) else "spanning", [spanning]))
+            if remaining_left:
+                block_groups.append(("column", remaining_left))
+            if remaining_right:
+                block_groups.append(("column", remaining_right))
+            sorted_items = [item for _, group in block_groups for item in group]
         else:
             sorted_items = sorted(non_furigana_items, key=lambda x: (round(x["y_min"] / 12) * 12, x["x_min"]))
+            if sorted_items:
+                block_groups.append(("body", sorted_items))
     else:
         sorted_items = sorted(non_furigana_items, key=lambda x: (round(x["y_min"] / 12) * 12, x["x_min"]))
+        if sorted_items:
+            block_groups.append(("body", sorted_items))
 
-    # 5. Sentence Reflow Engine (自然段落與文句重組)
+    blocks = [_make_block(block_type, group) for block_type, group in block_groups]
+    for item in items:
+        source_line_records[item["source_index"]] = _structured_line(item)
+    source_lines = [line for line in source_line_records if line is not None]
+
+    review_reason_set = {reason for line in source_lines for reason in line["review_reasons"]}
+    if page_type in {"toc", "vocabulary_cards", "questions"}:
+        review_reason_set.add("complex_layout")
+    review_reasons = sorted(review_reason_set)
+
+    # 6. Page-type-aware rendering
 
     if not enable_reflow:
         clean_text = "\n\n".join([it["text"] for it in sorted_items])
@@ -243,62 +427,29 @@ def process_page_layout(
             "raw_text": raw_text,
             "corrections_count": total_corrections,
             "columns_detected": columns_detected,
-            "furigana_filtered": furigana_count
+            "furigana_filtered": furigana_count,
+            "page_type": page_type,
+            "blocks": blocks,
+            "needs_review": bool(review_reasons),
+            "review_reasons": review_reasons,
+            "source_lines": source_lines,
         }
 
-    formatted_paragraphs = []
-    current_para = ""
-
-    for it in sorted_items:
-        t = it["text"].strip()
-        if not t:
-            continue
-
-        # Check if heading (short label or section delimiter)
-        is_heading = (
-            (len(t) < 20 and any(k in t for k in HEADING_KEYWORDS))
-            or t.startswith("【")
-            or t.startswith("第")
-        )
-
-        # Check if bullet item (e.g. list of examples or items)
-        is_bullet = any(t.startswith(b) for b in BULLET_PREFIXES)
-
-        if is_heading:
-            if current_para:
-                formatted_paragraphs.append(current_para)
-                current_para = ""
-            formatted_paragraphs.append(f"### {t}")
-            continue
-
-        if is_bullet:
-            if current_para:
-                formatted_paragraphs.append(current_para)
-                current_para = ""
-            current_para = f"- {t}"
-            continue
-
-        if not current_para:
-            current_para = t
-        else:
-            # Check if previous sentence ended cleanly
-            prev_ends_term = current_para.endswith(SENTENCE_TERMINATORS)
-            if prev_ends_term:
-                formatted_paragraphs.append(current_para)
-                current_para = t
-            else:
-                # Merge smoothly without linebreak or space (Japanese natural flow)
-                current_para += t
-
-    if current_para:
-        formatted_paragraphs.append(current_para)
-
-    clean_text = "\n\n".join(formatted_paragraphs)
+    if page_type == "prose":
+        clean_parts = [_format_prose_block(group, median_h, page_width) for _, group in block_groups]
+        clean_text = "\n\n".join(part for part in clean_parts if part)
+    else:
+        clean_text = "\n\n".join("\n".join(line["text"] for line in block["lines"]) for block in blocks)
 
     return {
         "clean_text": clean_text,
         "raw_text": raw_text,
         "corrections_count": total_corrections,
         "columns_detected": columns_detected,
-        "furigana_filtered": furigana_count
+        "furigana_filtered": furigana_count,
+        "page_type": page_type,
+        "blocks": blocks,
+        "needs_review": bool(review_reasons),
+        "review_reasons": review_reasons,
+        "source_lines": source_lines,
     }
