@@ -12,6 +12,7 @@ import os
 import sys
 import json
 import time
+import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Callable, Dict, Any, List, Optional, Generator, Tuple, Union
@@ -50,6 +51,10 @@ class BaseOCRBackend(ABC):
 
 class RapidOCRCUDABackend(BaseOCRBackend):
     def __init__(self, lang: str = "japan", high_accuracy: bool = True, device_id: int = 0):
+        import onnxruntime as ort
+        # Make CUDA/cuDNN DLLs installed in the Python environment visible on Windows.
+        if hasattr(ort, "preload_dlls"):
+            ort.preload_dlls(directory="")
         params = {
             "EngineConfig.onnxruntime.use_cuda": True,
             "EngineConfig.onnxruntime.cuda_ep_cfg": {
@@ -187,6 +192,31 @@ def get_ocr_backend(backend_mode: str = "auto", lang: str = "japan", high_accura
     return RapidOCRCPUBackend(lang=lang)
 
 
+_BACKEND_CACHE: Dict[Tuple[Any, str, str, bool], BaseOCRBackend] = {}
+_BACKEND_CACHE_LOCK = threading.Lock()
+# One inference at a time: the batch worker and single-page reruns share one
+# GPU session instead of loading a second copy of the models.
+_INFERENCE_LOCK = threading.Lock()
+
+
+def get_cached_ocr_backend(backend_mode: str = "auto", lang: str = "japan", high_accuracy: bool = True) -> BaseOCRBackend:
+    """Return a process-wide backend so model loading happens once per configuration."""
+    # Keying on the factory function keeps a monkeypatched get_ocr_backend from
+    # being served a backend created by a different factory.
+    key = (get_ocr_backend, backend_mode, lang, high_accuracy)
+    with _BACKEND_CACHE_LOCK:
+        backend = _BACKEND_CACHE.get(key)
+        if backend is None:
+            backend = get_ocr_backend(backend_mode=backend_mode, lang=lang, high_accuracy=high_accuracy)
+            _BACKEND_CACHE[key] = backend
+        return backend
+
+
+def _recognize(backend: BaseOCRBackend, image: np.ndarray) -> Dict[str, Any]:
+    with _INFERENCE_LOCK:
+        return backend.recognize(image)
+
+
 def render_page_to_np(page: fitz.Page, dpi: int) -> np.ndarray:
     zoom = dpi / 72.0
     mat = fitz.Matrix(zoom, zoom)
@@ -229,7 +259,7 @@ def process_pdf_gpu_adaptive_generator(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     start_t = time.perf_counter()
-    backend = get_ocr_backend(backend_mode=backend_mode, lang=lang, high_accuracy=high_accuracy)
+    backend = get_cached_ocr_backend(backend_mode=backend_mode, lang=lang, high_accuracy=high_accuracy)
     initialization_sec = time.perf_counter() - start_t
     doc = fitz.open(input_pdf)
     total_doc_pages = len(doc)
@@ -264,7 +294,7 @@ def process_pdf_gpu_adaptive_generator(
             if enable_clahe:
                 img = enhance_image_for_ocr(img)
             preprocess_end = time.perf_counter()
-            ocr_res = backend.recognize(img)
+            ocr_res = _recognize(backend, img)
             recognition_end = time.perf_counter()
 
             retried = False
@@ -278,7 +308,7 @@ def process_pdf_gpu_adaptive_generator(
                 img_retry = render_page_to_np(page, adaptive_retry_dpi)
                 if enable_clahe:
                     img_retry = enhance_image_for_ocr(img_retry)
-                ocr_retry = backend.recognize(img_retry)
+                ocr_retry = _recognize(backend, img_retry)
                 if ocr_retry["avg_score"] > ocr_res["avg_score"]:
                     ocr_res = ocr_retry
                     retried = True
@@ -320,6 +350,7 @@ def process_pdf_gpu_adaptive_generator(
 
             page_record = {
                 "page": page_no, "clean": layout_res["clean_text"].strip(), "raw": layout_res["raw_text"].strip(),
+                "clean_line_sources": layout_res.get("clean_line_sources"),
                 "page_type": layout_res["page_type"], "blocks": layout_res["blocks"],
                 "source_lines": layout_res["source_lines"],
                 "needs_review": layout_res["needs_review"], "review_reasons": layout_res["review_reasons"],
@@ -497,18 +528,18 @@ def process_single_page(
 
     try:
         page = doc[page_no - 1]
-        backend = get_ocr_backend(backend_mode=backend_mode)
+        backend = get_cached_ocr_backend(backend_mode=backend_mode)
         img = render_page_to_np(page, base_dpi)
         if enable_clahe:
             img = enhance_image_for_ocr(img)
-        ocr_res = backend.recognize(img)
+        ocr_res = _recognize(backend, img)
         selected_dpi = base_dpi
 
         if adaptive_retry and ocr_res["avg_score"] < confidence_thresh:
             img_retry = render_page_to_np(page, adaptive_retry_dpi)
             if enable_clahe:
                 img_retry = enhance_image_for_ocr(img_retry)
-            ocr_retry = backend.recognize(img_retry)
+            ocr_retry = _recognize(backend, img_retry)
             if ocr_retry["avg_score"] > ocr_res["avg_score"]:
                 ocr_res = ocr_retry
                 selected_dpi = adaptive_retry_dpi
@@ -533,6 +564,7 @@ def process_single_page(
         return {
             "page": page_no,
             "clean": layout_res["clean_text"].strip(),
+            "clean_line_sources": layout_res.get("clean_line_sources"),
             "raw": layout_res["raw_text"].strip(),
             "page_type": layout_res["page_type"],
             "blocks": layout_res["blocks"],

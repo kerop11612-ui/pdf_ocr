@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import threading
 import time
@@ -33,34 +34,26 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _job_summary(job: dict[str, Any], storage_path: Path | None = None) -> dict[str, Any]:
+def _job_summary(job: dict[str, Any], service: "JobService | None" = None) -> dict[str, Any]:
     summary = {key: value for key, value in job.items() if key not in FULL_TEXT_FIELDS}
-    # Use cached stats from job.json (updated incrementally by _update_cached_stats)
-    if "needs_review_count" not in summary and storage_path:
-        _update_cached_stats_from_disk(job, storage_path)
-        summary["needs_review_count"] = job.get("needs_review_count", 0)
-        summary["page_types_summary"] = job.get("page_types_summary", {})
+    # job.json caches the stats once outputs are aggregated; running or legacy jobs
+    # derive them from the mtime-cached page index instead of re-reading every page.
+    if "needs_review_count" not in summary and service is not None:
+        pages = service.page_summaries(job["id"])
+        page_types: dict[str, int] = {}
+        for p in pages:
+            page_types[p["page_type"]] = page_types.get(p["page_type"], 0) + 1
+        summary["needs_review_count"] = sum(1 for p in pages if _is_pending(p))
+        summary["page_types_summary"] = page_types
     return summary
 
 
-def _update_cached_stats_from_disk(job: dict[str, Any], storage_path: Path) -> None:
-    """One-time migration: scan pages dir and populate cached stats in job dict."""
-    pages_dir = storage_path / job["id"] / "pages"
-    if not pages_dir.is_dir():
-        return
-    needs_review_count = 0
-    page_types: dict[str, int] = {}
-    for pf in pages_dir.glob("*.json"):
-        try:
-            p = json.loads(pf.read_text(encoding="utf-8"))
-            if p.get("needs_review"):
-                needs_review_count += 1
-            ptype = p.get("page_type") or "prose"
-            page_types[ptype] = page_types.get(ptype, 0) + 1
-        except Exception:
-            pass
-    job["needs_review_count"] = needs_review_count
-    job["page_types_summary"] = page_types
+def _is_pending(page: dict[str, Any]) -> bool:
+    return bool(page.get("needs_review")) and not (page.get("reviewed") or page.get("user_edited"))
+
+
+def _page_sort_key(path: Path) -> int:
+    return int(path.stem) if path.stem.isdigit() else 0
 
 
 class JobService:
@@ -71,13 +64,20 @@ class JobService:
         self.lock = threading.RLock()
         self.cancel_events: dict[str, threading.Event] = {}
         self.stop_event = threading.Event()
+        # path -> ((mtime_ns, size), summary): avoids re-parsing every page JSON on each poll
+        self._page_index: dict[Path, tuple[tuple[int, int], dict[str, Any]]] = {}
         self._recover()
         if start_worker:
             threading.Thread(target=self._worker, daemon=True, name="auradoc-ocr-worker").start()
 
     def _recover(self) -> None:
         for status_file in self.storage.glob("*/job.json"):
-            job = json.loads(status_file.read_text(encoding="utf-8"))
+            try:
+                job = json.loads(status_file.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue  # a corrupted record must not stop the service from starting
+            if not self._valid_id(job.get("id", "")):
+                continue
             if job["status"] in {"queued", "running"}:
                 job["status"] = "queued"
                 job["message"] = "已於服務重啟後重新排隊"
@@ -115,8 +115,41 @@ class JobService:
             return json.loads(path.read_text(encoding="utf-8"))
 
     def list(self, limit: int = 5) -> list[dict[str, Any]]:
-        records = [_job_summary(self.get(path.parent.name), self.storage) for path in self.storage.glob("*/job.json")]
-        return sorted(records, key=lambda job: job["created_at"], reverse=True)[:max(1, min(limit, 50))]
+        jobs = []
+        for path in self.storage.glob("*/job.json"):
+            try:
+                jobs.append(self.get(path.parent.name))
+            except (HTTPException, OSError, ValueError):
+                continue  # skip foreign folders / corrupted records instead of failing the whole list
+        jobs.sort(key=lambda job: job.get("created_at", 0), reverse=True)
+        # Summarise only the jobs actually returned.
+        return [_job_summary(job, self) for job in jobs[:max(1, min(limit, 50))]]
+
+    def page_summaries(self, job_id: str) -> list[dict[str, Any]]:
+        pages_dir = self._path(job_id) / "pages"
+        if not pages_dir.is_dir():
+            return []
+        summaries = []
+        for pf in sorted(pages_dir.glob("*.json"), key=_page_sort_key):
+            try:
+                st = pf.stat()
+                stamp = (st.st_mtime_ns, st.st_size)
+                cached = self._page_index.get(pf)
+                if cached is None or cached[0] != stamp:
+                    p = json.loads(pf.read_text(encoding="utf-8"))
+                    cached = (stamp, {
+                        "page": p.get("page", _page_sort_key(pf)),
+                        "page_type": p.get("page_type") or "prose",
+                        "needs_review": bool(p.get("needs_review", False)),
+                        "reviewed": bool(p.get("reviewed", False)),
+                        "review_reasons": p.get("review_reasons", []),
+                        "user_edited": bool(p.get("user_edited", False)),
+                    })
+                    self._page_index[pf] = cached
+                summaries.append(dict(cached[1]))
+            except (OSError, ValueError):
+                continue
+        return summaries
 
     def _write_page_result(self, job_id: str, page: dict[str, Any]) -> None:
         page_dir = self._path(job_id) / "pages"
@@ -155,17 +188,20 @@ class JobService:
         return job
 
     def cancel(self, job_id: str) -> dict[str, Any]:
-        job = self.get(job_id)
-        if job["status"] in {"queued", "running"}:
-            job["cancel_requested"] = True
-            self.cancel_events.setdefault(job_id, threading.Event()).set()
-            if job["status"] == "queued":
-                job["status"] = "cancelled"
-                job["message"] = "已取消（尚未開始）"
-            else:
-                job["message"] = "取消要求已收到，將保留已完成頁面"
-            self._save(job)
-        return self.get(job_id)
+        # Hold the lock across read-modify-write so the worker's progress save
+        # cannot overwrite cancel_requested.
+        with self.lock:
+            job = self.get(job_id)
+            if job["status"] in {"queued", "running"}:
+                job["cancel_requested"] = True
+                self.cancel_events.setdefault(job_id, threading.Event()).set()
+                if job["status"] == "queued":
+                    job["status"] = "cancelled"
+                    job["message"] = "已取消（尚未開始）"
+                else:
+                    job["message"] = "取消要求已收到，將保留已完成頁面"
+                self._save(job)
+            return self.get(job_id)
 
     def update_page_clean(self, job_id: str, page_num: int, clean_text: str) -> dict[str, Any]:
         with self.lock:
@@ -174,10 +210,11 @@ class JobService:
                 raise HTTPException(404, "找不到指定頁面")
             data = json.loads(path.read_text(encoding="utf-8"))
             data["clean"] = clean_text.strip()
+            data["clean_line_sources"] = None
             data["user_edited"] = True
             data["reviewed"] = True
             data["reviewed_at"] = time.time()
-            _write_json(path, data)
+            self._write_page_result(job_id, data)
             self._reaggregate_outputs(job_id)
             return data
 
@@ -187,15 +224,17 @@ class JobService:
             if not path.is_file():
                 raise HTTPException(404, "找不到指定頁面")
             data = json.loads(path.read_text(encoding="utf-8"))
-            data["reviewed"] = reviewed
+            data["reviewed"] = bool(reviewed)
             data["reviewed_at"] = time.time()
-            _write_json(path, data)
+            self._write_page_result(job_id, data)
             self._reaggregate_outputs(job_id)
             return data
 
     def rerun_page(self, job_id: str, page_num: int, options_override: dict[str, Any] | None = None) -> dict[str, Any]:
         with self.lock:
             job = self.get(job_id)
+            if page_num < 1 or page_num > job.get("total_pages", 0):
+                raise HTTPException(404, "找不到頁面")
             pdf_path = self._path(job_id) / "source.pdf"
             if not pdf_path.is_file():
                 raise HTTPException(404, "找不到來源 PDF")
@@ -227,7 +266,7 @@ class JobService:
         pages_dir = folder / "pages"
         if not pages_dir.is_dir():
             return
-        page_files = sorted(pages_dir.glob("*.json"), key=lambda p: int(p.stem) if p.stem.isdigit() else 0)
+        page_files = sorted(pages_dir.glob("*.json"), key=_page_sort_key)
         clean_parts: list[str] = []
         clean_reviewed_parts: list[str] = []
         review_pending_parts: list[str] = []
@@ -248,11 +287,10 @@ class JobService:
             except Exception:
                 pass
 
-        if clean_reviewed_parts:
-            (folder / "clean_reviewed.md").write_text("\n\n".join(clean_reviewed_parts), encoding="utf-8")
-        if review_pending_parts:
-            (folder / "review_pending.md").write_text("\n\n".join(review_pending_parts), encoding="utf-8")
-        
+        # Always rewrite: an empty list must replace any stale earlier content.
+        (folder / "clean_reviewed.md").write_text("\n\n".join(clean_reviewed_parts), encoding="utf-8")
+        (folder / "review_pending.md").write_text("\n\n".join(review_pending_parts), encoding="utf-8")
+
         job = self.get(job_id)
         created_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(job.get('created_at', time.time())))
         obsidian_frontmatter = (
@@ -272,7 +310,7 @@ class JobService:
         pages_dir = folder / "pages"
         if not pages_dir.is_dir():
             return
-        page_files = sorted(pages_dir.glob("*.json"), key=lambda p: int(p.stem) if p.stem.isdigit() else 0)
+        page_files = sorted(pages_dir.glob("*.json"), key=_page_sort_key)
         clean_parts: list[str] = []
         raw_parts: list[str] = []
         structured_lines: list[str] = []
@@ -314,46 +352,70 @@ class JobService:
             if not job_id:
                 time.sleep(.15)
                 continue
-            job = self.get(job_id)
-            if job["status"] == "cancelled":
+            try:
+                job = self.get(job_id)
+                if job["status"] == "cancelled":
+                    continue
+                self._run(job)
+            except Exception:
+                # A deleted or corrupted job must never kill the only worker thread.
                 continue
-            self._run(job)
 
     def _run(self, job: dict[str, Any]) -> None:
-        from directml_pipeline import process_pdf_gpu_adaptive_generator
+        try:
+            from directml_pipeline import process_pdf_gpu_adaptive_generator
+        except Exception as exc:
+            job = self.get(job["id"])
+            job.update({"status": "failed", "message": str(exc)})
+            self._save(job)
+            return
         job["status"], job["message"] = "running", "正在初始化 OCR"
         self._save(job)
-        folder = self._path(job["id"])
+        job_id = job["id"]
+        folder = self._path(job_id)
         options = job["options"]
+        cancel_event = self.cancel_events.setdefault(job_id, threading.Event())
         try:
             result = None
             for progress, message, clean, raw, done, final in process_pdf_gpu_adaptive_generator(
                 folder / "source.pdf", folder, start_page=job["pages"][0], end_page=job["pages"][1],
-                backend_mode=job["backend_requested"], cancel_check=lambda: self.cancel_events.setdefault(job["id"], threading.Event()).is_set(),
+                backend_mode=job["backend_requested"], cancel_check=cancel_event.is_set,
                 enable_clahe=options["clahe"], enable_reflow=options["reflow"], enable_two_column=options["two_column"],
                 enable_furigana_filter=options["furigana"], enable_homoglyphs=options["homoglyphs"],
                 adaptive_retry=options["adaptive_retry"], stream_full_text=False,
-                on_page=lambda page: self._write_page_result(job["id"], page)):
-                job = _job_summary(self.get(job["id"]))
-                job.update({"completed_pages": round(progress * (job["pages"][1] - job["pages"][0] + 1)), "progress": round(progress * 100), "message": message})
+                on_page=lambda page: self._write_page_result(job_id, page)):
                 if done:
                     result = final
-                self._save(job)
-            job = self.get(job["id"])
-            if job.get("cancel_requested"):
-                job.update({"status": "cancelled", "message": "已取消；已完成內容已保留"})
-            elif result:
-                outputs = {
-                    "clean": "clean.md", "raw": "raw.txt", "metrics": "metrics.json", "structured": "structured.jsonl",
-                    "clean_reviewed": "clean_reviewed.md", "review_pending": "review_pending.md", "obsidian": "obsidian.md"
-                }
+                with self.lock:  # atomic read-modify-write; see cancel()
+                    job = _job_summary(self.get(job_id))
+                    job.update({"completed_pages": round(progress * (job["pages"][1] - job["pages"][0] + 1)), "progress": round(progress * 100), "message": message})
+                    self._save(job)
+            # Held across the final read-modify-write so a review/edit/cancel arriving now
+            # is not overwritten.
+            with self.lock:
+                job = self.get(job_id)
+                if job.get("cancel_requested") or cancel_event.is_set():
+                    job.update({"status": "cancelled", "cancel_requested": True, "message": "已取消；已完成內容已保留"})
+                    self._save(job)
+                    return
+                if not result:
+                    job.update({"status": "failed", "message": "OCR 結束但未產生結果"})
+                    self._save(job)
+                    return
+                outputs = dict(ALLOWED_DOWNLOADS)
                 shutil.copyfile(result["md_path"], folder / outputs["clean"])
                 shutil.copyfile(result["raw_path"], folder / outputs["raw"])
                 shutil.copyfile(result["metrics_path"], folder / outputs["metrics"])
                 shutil.copyfile(result["structured_path"], folder / outputs["structured"])
-                self._generate_auxiliary_outputs(job["id"])
                 job.update({"status": "completed", "progress": 100, "message": "處理完成", "outputs": outputs, "backend_actual": result.get("backend_actual"), "provider_sets": result.get("provider_sets", [])})
-            self._save(job)
+                self._save(job)
+                if any(p["reviewed"] or p["user_edited"] for p in self.page_summaries(job_id)):
+                    # Pages were proofread while OCR was still running: rebuild the outputs
+                    # from the page files so the pipeline's copies don't discard those edits.
+                    self._reaggregate_outputs(job_id)
+                else:
+                    self._generate_auxiliary_outputs(job_id)
+            return
         except Exception as exc:
             job = self.get(job["id"])
             job.update({"status": "failed", "message": str(exc)})
@@ -385,30 +447,12 @@ def create_app(storage: Path | None = None, start_worker: bool = True) -> FastAP
         return detect_hardware_summary()
 
     @app.get("/api/jobs/{job_id}")
-    def read_job(job_id: str): return _job_summary(service.get(job_id), service.storage)
+    def read_job(job_id: str): return _job_summary(service.get(job_id), service)
 
     @app.get("/api/jobs/{job_id}/pages")
     def list_job_pages(job_id: str):
         service.get(job_id)
-        pages_dir = service._path(job_id) / "pages"
-        if not pages_dir.is_dir():
-            return []
-        page_files = sorted(pages_dir.glob("*.json"), key=lambda p: int(p.stem) if p.stem.isdigit() else 0)
-        summaries = []
-        for pf in page_files:
-            try:
-                p = json.loads(pf.read_text(encoding="utf-8"))
-                summaries.append({
-                    "page": p.get("page", int(pf.stem) if pf.stem.isdigit() else 0),
-                    "page_type": p.get("page_type", "prose"),
-                    "needs_review": p.get("needs_review", False),
-                    "reviewed": p.get("reviewed", False),
-                    "review_reasons": p.get("review_reasons", []),
-                    "user_edited": p.get("user_edited", False)
-                })
-            except Exception:
-                pass
-        return summaries
+        return service.page_summaries(job_id)
 
     @app.get("/api/jobs/{job_id}/pages/{page}")
     def page_result(job_id: str, page: int):
@@ -417,23 +461,25 @@ def create_app(storage: Path | None = None, start_worker: bool = True) -> FastAP
         if not path.is_file(): raise HTTPException(404, "該頁尚未完成")
         return json.loads(path.read_text(encoding="utf-8"))
 
+    # Plain `def` (not async): these do blocking file I/O and OCR, so FastAPI must
+    # run them in its threadpool instead of on the event loop.
     @app.put("/api/jobs/{job_id}/pages/{page}/clean")
-    async def update_page_clean(job_id: str, page: int, payload: dict[str, Any]):
+    def update_page_clean(job_id: str, page: int, payload: dict[str, Any]):
         clean_text = payload.get("clean", "")
         return service.update_page_clean(job_id, page, clean_text)
 
     @app.post("/api/jobs/{job_id}/pages/{page}/review")
-    async def toggle_page_review(job_id: str, page: int, payload: dict[str, Any] | None = None):
+    def toggle_page_review(job_id: str, page: int, payload: dict[str, Any] | None = None):
         reviewed = (payload or {}).get("reviewed", True)
         return service.review_page(job_id, page, reviewed)
 
     @app.post("/api/jobs/{job_id}/pages/{page}/rerun")
-    async def rerun_page(job_id: str, page: int, payload: dict[str, Any] | None = None):
+    def rerun_page(job_id: str, page: int, payload: dict[str, Any] | None = None):
         options = payload or {}
         return service.rerun_page(job_id, page, options)
 
     @app.post("/api/jobs/{job_id}/cancel")
-    def cancel_job(job_id: str): return _job_summary(service.cancel(job_id), service.storage)
+    def cancel_job(job_id: str): return _job_summary(service.cancel(job_id), service)
 
     @app.get("/api/jobs/{job_id}/download/{kind}")
     def download(job_id: str, kind: str):
@@ -441,7 +487,9 @@ def create_app(storage: Path | None = None, start_worker: bool = True) -> FastAP
             raise HTTPException(404, "找不到成果")
         path = service._path(job_id) / ALLOWED_DOWNLOADS[kind]
         if not path.is_file():
-            service._reaggregate_outputs(job_id)
+            service.get(job_id)
+            with service.lock:
+                service._reaggregate_outputs(job_id)
         if not path.is_file():
             raise HTTPException(404, "成果尚未產生")
         return FileResponse(path, filename=path.name)
@@ -453,13 +501,20 @@ def create_app(storage: Path | None = None, start_worker: bool = True) -> FastAP
             raise HTTPException(404, "找不到頁面")
         output = service._path(job_id) / f"preview-{page}.png"
         if not output.is_file():
-            doc = fitz.open(service._path(job_id) / "source.pdf")
-            pix = doc[page - 1].get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
-            pix.save(output)
-            doc.close()
+            # Render to a unique temp file, then rename: concurrent requests for the same
+            # page must never serve a half-written PNG.
+            temp = output.with_name(f"preview-{page}.{uuid.uuid4().hex}.tmp")
+            with fitz.open(service._path(job_id) / "source.pdf") as doc:
+                doc[page - 1].get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False).save(temp, output="png")
+            try:
+                temp.replace(output)
+            except OSError:
+                temp.unlink(missing_ok=True)  # another request won the race on Windows
+                if not output.is_file():
+                    raise
         return FileResponse(output, media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
 
     return app
 
 
-app = create_app()
+app = create_app(Path(os.environ["AURADOC_STORAGE"]) if os.environ.get("AURADOC_STORAGE") else None)

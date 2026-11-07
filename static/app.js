@@ -1,436 +1,703 @@
-// AuraDoc OCR Proofreading Workbench Controller (ui-ux-pro-max edition)
-(function() {
+// AuraDoc 校對工作台
+(function () {
   'use strict';
 
-  const $ = selector => document.querySelector(selector);
-  const $$ = selector => document.querySelectorAll(selector);
+  const $ = s => document.querySelector(s);
+  const $$ = s => document.querySelectorAll(s);
 
-  // State
+  // ---------- State ----------
   let currentJobId = null;
   let currentJob = null;
-  let currentPage = 1;
+  let currentPage = null;
+  let loadedPage = null;          // page number whose data is rendered
   let jobPages = [];
   let currentPageData = null;
   let pollTimer = null;
   let allHistory = [];
   let isEditing = false;
+  let rerunArmed = null;          // timeout id while the rerun button awaits a second click
+  let allDoneAnnounced = false;
+  let reviewInFlight = false;     // blocks double Space presses from sending two requests
+  let saveInFlight = false;
+  let lastScrolledPage = null;    // minimap only auto-scrolls when the current page changes
+  let historyTimer = null;
 
-  // Zoom & Pan Canvas State
-  let zoomScale = 1.0;
-  let panX = 0;
-  let panY = 0;
-  let isPanning = false;
-  let panStartX = 0;
-  let panStartY = 0;
-
-  const PAGE_TYPE_LABELS = {
-    prose: '文章段落',
-    questions: '測驗題庫',
-    vocabulary_cards: '單字卡',
-    toc: '書籍目錄',
-    decorative_or_blank: '空白/裝飾'
-  };
-
-  const REVIEW_REASON_LABELS = {
-    low_confidence: '低信心度',
-    unknown_character: '未知缺字',
-    repeated_character: '重複雜訊',
-    mixed_symbol: '異常混雜符號',
-    complex_layout: '多欄複雜排版'
-  };
-
-  const STATUS_LABELS = {
-    queued: '排隊中',
-    running: '處理中',
-    completed: '已完成',
-    cancelled: '已取消',
-    failed: '失敗'
-  };
-
-  // SVG Icons Helper
-  const SVG_ICONS = {
-    check: '<svg class="ui-icon" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg>',
-    warning: '<svg class="ui-icon" viewBox="0 0 24 24"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
-    danger: '<svg class="ui-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>',
-    info: '<svg class="ui-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>',
-    edit: '<svg class="ui-icon" viewBox="0 0 24 24"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>',
-    close: '<svg class="ui-icon" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>'
-  };
-
-  // Toast Notification System (SVG Iconized)
-  function showToast(message, type = 'info', duration = 2800) {
-    const container = $('#toast-container') || document.body;
-    const toast = document.createElement('div');
-    toast.className = `toast toast-${type}`;
-    const iconSvg = SVG_ICONS[type] || SVG_ICONS.info;
-    toast.innerHTML = `${iconSvg}<span>${message}</span>`;
-    container.appendChild(toast);
-    setTimeout(() => {
-      toast.style.opacity = '0';
-      toast.style.transform = 'translateY(12px) scale(0.96)';
-      toast.style.transition = 'all 0.22s cubic-bezier(0.16, 1, 0.3, 1)';
-      setTimeout(() => toast.remove(), 240);
-    }, duration);
+  // Turn a failed response into a readable message (FastAPI 422 details are arrays,
+  // proxies may return HTML).
+  async function errorMessage(res, fallback) {
+    try {
+      const body = await res.json();
+      const d = body?.detail;
+      if (typeof d === 'string') return d;
+      if (Array.isArray(d)) return d.map(x => x?.msg || String(x)).join('；');
+    } catch { /* not JSON */ }
+    return `${fallback}（HTTP ${res.status}）`;
   }
 
-  // 1. Hardware Detection
+  let zoomScale = 1, panX = 0, panY = 0;
+  let isPanning = false, panStartX = 0, panStartY = 0;
+
+  const PAGE_TYPE_LABELS = {
+    prose: '文章', questions: '題目', vocabulary_cards: '單字卡',
+    toc: '目錄', decorative_or_blank: '空白／裝飾'
+  };
+  const REVIEW_REASON_LABELS = {
+    low_confidence: '信心度低', unknown_character: '有缺字', repeated_character: '重複字元',
+    mixed_symbol: '符號混雜', choice_number_mismatch: '選項編號可能誤讀',
+    complex_layout: '版面複雜', missing_geometry: '缺少位置資訊'
+  };
+  const STATUS_LABELS = {
+    queued: '排隊中', running: '辨識中', completed: '已完成', cancelled: '已停止', failed: '失敗'
+  };
+
+  // ---------- Toast ----------
+  function showToast(message, type = 'info', action = null, duration = 3200) {
+    const container = $('#toast-container');
+    const toast = document.createElement('div');
+    toast.className = `toast toast-${type}`;
+    toast.setAttribute('role', type === 'danger' ? 'alert' : 'status');
+    const text = document.createElement('span');
+    text.textContent = message;
+    toast.appendChild(text);
+    let timer;
+    const dismiss = () => {
+      clearTimeout(timer);
+      toast.classList.add('leaving');
+      setTimeout(() => toast.remove(), 180);
+    };
+    if (action) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'toast-action';
+      btn.textContent = action.label;
+      btn.addEventListener('click', () => { dismiss(); action.onClick(); });
+      toast.appendChild(btn);
+      duration = Math.max(duration, 5000);
+    }
+    container.appendChild(toast);
+    timer = setTimeout(dismiss, duration);
+  }
+
+  const backendLabel = j => j.backend_actual
+    ? (j.backend_actual.includes('DirectML') ? 'DirectML' : (j.backend_actual.includes('CUDA') ? 'CUDA' : 'CPU'))
+    : ({ auto: '自動', gpu: 'GPU', cuda: 'CUDA', dml: 'DirectML', cpu: 'CPU' }[j.backend_requested] || '自動');
+
+  // ---------- Hardware ----------
   async function loadHardware() {
     try {
       const res = await fetch('/api/hardware');
       if (!res.ok) return;
       const data = await res.json();
-      const unique = arr => [...new Set(arr || [])].join('、') || '無';
-      const gpuText = unique(data.gpu);
-      const isCuda = (data.onnxruntime_providers || []).includes('CUDAExecutionProvider');
-      const isDml = (data.onnxruntime_providers || []).includes('DmlExecutionProvider');
-      const accelText = isCuda ? 'NVIDIA CUDA 支援' : (isDml ? 'DirectML 支援' : 'CPU 運算');
-      const badge = $('#hardware-badge');
-      if (badge) {
-        badge.textContent = `硬體：${gpuText.slice(0, 24)} · ${accelText}`;
+      const providers = data.onnxruntime_providers || [];
+      const gpu = [...new Set(data.gpu || [])];
+      const accel = providers.includes('CUDAExecutionProvider') ? 'CUDA'
+        : providers.includes('DmlExecutionProvider') ? 'DirectML' : 'CPU';
+      const gpuName = (gpu[0] || '').replace(/^NVIDIA\s+/, '').replace(/^GeForce\s+/, '');
+      $('#hardware-badge').textContent = gpuName ? `${gpuName} · ${accel}` : accel;
+      $('#hardware-desc').textContent =
+        `CPU：${[...new Set(data.cpu || [])].join('、') || '—'}　GPU：${gpu.join('、') || '—'}　Providers：${providers.join('、') || '—'}`;
+    } catch { /* hardware info is optional */ }
+  }
+
+  // ---------- Routing ----------
+  function route() {
+    const id = location.hash.slice(1);
+    const inWorkbench = Boolean(id);
+    $('#view-home').hidden = inWorkbench;
+    $('#view-workbench').hidden = !inWorkbench;
+    $('#btn-home').hidden = !inWorkbench;
+    if (inWorkbench) {
+      if (id !== currentJobId) {
+        currentJobId = id;
+        currentJob = null;
+        currentPage = null;
+        loadedPage = null;
+        currentPageData = null;
+        jobPages = [];
+        allDoneAnnounced = false;
+        lastScrolledPage = null;
+        $('#page-filter').value = 'all';
+        resetZoom();
       }
-      const desc = $('#hardware-desc');
-      if (desc) {
-        desc.textContent = `CPU：${unique(data.cpu)} ｜ GPU：${gpuText} ｜ Providers：${unique(data.onnxruntime_providers)}`;
-      }
-    } catch (err) {
-      console.warn('Hardware detection error:', err);
+      clearTimeout(historyTimer);
+      pollJob();
+    } else {
+      clearTimeout(pollTimer);
+      currentJobId = null;
+      currentJob = null;
+      document.title = 'AuraDoc 校對工作台';
+      loadHistory();
     }
   }
 
-  // 2. Preset Modes & Range Toggle
+  function goHome() {
+    if (!confirmDiscardEdits()) return;
+    exitEditMode();
+    location.hash = '';
+  }
+
+  window.addEventListener('hashchange', () => {
+    if (isDirty() && !confirm('有尚未儲存的修改，確定要離開嗎？')) {
+      history.replaceState(null, '', `#${currentJobId}`);
+      return;
+    }
+    exitEditMode();
+    route();
+  });
+  $('#btn-home').addEventListener('click', goHome);
+  $('#brand-link').addEventListener('click', e => { e.preventDefault(); goHome(); });
+  window.addEventListener('beforeunload', e => {
+    if (isDirty()) { e.preventDefault(); e.returnValue = ''; }
+  });
+
+  // ---------- New job form ----------
   const form = $('#job-form');
   const fileInput = $('#file');
   const fileInfo = $('#file-info');
-  const rangeModeInput = $('#range_mode');
-  const customRangeBox = $('#custom-range-box');
+  const dropZone = $('#drop-zone');
+  const submitBtn = $('#submit-btn');
 
-  if (fileInput) {
-    fileInput.addEventListener('change', async () => {
-      const f = fileInput.files && fileInput.files[0];
-      if (!f) {
-        fileInfo.textContent = '請選擇 PDF 檔案';
-        return;
-      }
-      try {
-        const header = new TextDecoder().decode(await f.slice(0, 5).arrayBuffer());
-        if (header.startsWith('%PDF-')) {
-          fileInfo.textContent = `${f.name} (${(f.size / (1024 * 1024)).toFixed(1)} MB)`;
-        } else {
-          fileInfo.textContent = '警告：所選檔案可能非標準 PDF';
-        }
-      } catch {
-        fileInfo.textContent = `${f.name} (${(f.size / (1024 * 1024)).toFixed(1)} MB)`;
-      }
-    });
-  }
-
-  $$('input[name="preset_mode"]').forEach(radio => {
-    radio.addEventListener('change', () => {
-      const val = radio.value;
-      if (val === 'preview') {
-        rangeModeInput.value = 'first5';
-        customRangeBox.hidden = true;
-      } else if (val === 'textbook') {
-        rangeModeInput.value = 'all';
-        customRangeBox.hidden = true;
-      } else if (val === 'questions') {
-        rangeModeInput.value = 'all';
-        customRangeBox.hidden = true;
-        if (form.elements['two_column']) form.elements['two_column'].checked = true;
-      } else if (val === 'custom') {
-        rangeModeInput.value = 'custom';
-        customRangeBox.hidden = false;
-      }
-    });
+  fileInput.addEventListener('change', () => {
+    const f = fileInput.files && fileInput.files[0];
+    submitBtn.disabled = !f;
+    dropZone.classList.toggle('has-file', Boolean(f));
+    fileInfo.textContent = f ? `${f.name}（${(f.size / 1048576).toFixed(1)} MB）` : '選擇或拖入 PDF';
   });
 
-  // 3. Form Submission
-  if (form) {
-    form.addEventListener('submit', async e => {
-      e.preventDefault();
-      const submitBtn = $('#submit-btn');
-      submitBtn.disabled = true;
-      const data = new FormData(form);
-
-      ['adaptive_retry', 'clahe', 'reflow', 'two_column', 'furigana', 'homoglyphs'].forEach(k => {
-        if (form.elements[k]) data.set(k, String(form.elements[k].checked));
-      });
-
-      $('#status-msg').textContent = '正在上傳 PDF 並建立工作紀錄…';
-      updatePipelineStage('ready');
-
-      try {
-        const res = await fetch('/api/jobs', { method: 'POST', body: data });
-        const body = await res.json();
-        if (!res.ok) throw new Error(body.detail || '建立工作失敗');
-        currentJobId = body.id;
-        history.replaceState(null, '', `#${body.id}`);
-        showJob(body);
-        pollJob();
-        loadHistory();
-        showToast('工作已排入佇列！', 'success');
-      } catch (err) {
-        $('#status-msg').textContent = `建立失敗：${err.message}`;
-        showToast(`建立失敗：${err.message}`, 'danger');
-      } finally {
-        submitBtn.disabled = false;
-      }
-    });
-  }
-
-  // 4. Cancel Job
-  const cancelBtn = $('#cancel-btn');
-  if (cancelBtn) {
-    cancelBtn.addEventListener('click', async () => {
-      if (!currentJobId) return;
-      try {
-        const res = await fetch(`/api/jobs/${currentJobId}/cancel`, { method: 'POST' });
-        const body = await res.json();
-        showJob(body);
-        showToast('已送出取消要求', 'warning');
-      } catch {
-        $('#status-msg').textContent = '取消要求送出失敗。';
-      }
-    });
-  }
-
-  // 5. Pipeline Stages Rendering
-  function updatePipelineStage(status) {
-    const stages = $$('#pipeline-stages .stage');
-    stages.forEach(s => s.classList.remove('active', 'completed'));
-    if (status === 'ready' || status === 'queued') {
-      const s = $('[data-stage="ready"]');
-      if (s) s.classList.add('active');
-    } else if (status === 'running' || status === 'init') {
-      const s0 = $('[data-stage="ready"]'); if (s0) s0.classList.add('completed');
-      const s1 = $('[data-stage="init"]'); if (s1) s1.classList.add('completed');
-      const s2 = $('[data-stage="ocr"]'); if (s2) s2.classList.add('active');
-      const s3 = $('[data-stage="layout"]'); if (s3) s3.classList.add('active');
-    } else if (status === 'completed' || status === 'done') {
-      stages.forEach(s => s.classList.add('completed'));
+  let dragDepth = 0;
+  dropZone.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInput.click(); }
+  });
+  dropZone.addEventListener('dragenter', e => {
+    if (!e.dataTransfer?.types.includes('Files')) return;
+    e.preventDefault(); dragDepth += 1; dropZone.classList.add('is-dragging');
+  });
+  dropZone.addEventListener('dragover', e => {
+    if (!e.dataTransfer?.types.includes('Files')) return;
+    e.preventDefault(); e.dataTransfer.dropEffect = 'copy';
+  });
+  dropZone.addEventListener('dragleave', () => {
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (!dragDepth) dropZone.classList.remove('is-dragging');
+  });
+  dropZone.addEventListener('drop', e => {
+    e.preventDefault(); dragDepth = 0; dropZone.classList.remove('is-dragging');
+    const files = [...(e.dataTransfer?.files || [])];
+    if (files.length !== 1 || !files[0].name.toLowerCase().endsWith('.pdf')) {
+      showToast('請一次拖入一個 PDF 檔案', 'warning');
+      return;
     }
-  }
+    const t = new DataTransfer();
+    t.items.add(files[0]);
+    fileInput.files = t.files;
+    fileInput.dispatchEvent(new Event('change'));
+  });
+  ['dragover', 'drop'].forEach(type => window.addEventListener(type, e => {
+    if (e.dataTransfer?.types.includes('Files')) e.preventDefault();
+  }));
 
-  // 6. Job Summary Display
-  function showJob(job) {
-    currentJob = job;
-    currentJobId = job.id;
+  $$('input[name="range_mode"]').forEach(r => r.addEventListener('change', () => {
+    $('#custom-range-box').hidden = form.elements.range_mode.value !== 'custom';
+  }));
 
-    $('#job-title').textContent = job.filename || '未知文件';
-    $('#job-status-badge').textContent = STATUS_LABELS[job.status] || job.status;
-    $('#status-msg').textContent = job.message || '';
-    $('#progress').value = job.progress || 0;
-    $('#progress-percent').textContent = `${job.progress || 0}%`;
-
-    const totalInJob = job.pages ? (job.pages[1] - job.pages[0] + 1) : (job.total_pages || 0);
-    $('#metric-pages').textContent = `${job.completed_pages || 0} / ${totalInJob} 頁`;
-    $('#metric-review-count').textContent = typeof job.needs_review_count === 'number' ? `${job.needs_review_count} 頁` : '-';
-    
-    const backendLabel = job.backend_actual ? (job.backend_actual.includes('DirectML') ? 'DirectML GPU' : (job.backend_actual.includes('CUDA') ? 'CUDA GPU' : 'CPU')) : (job.backend_requested || 'Auto');
-    $('#metric-backend').textContent = backendLabel;
-
-    cancelBtn.disabled = !['queued', 'running'].includes(job.status);
-    updatePipelineStage(job.status === 'completed' ? 'done' : (job.status === 'running' ? 'running' : 'ready'));
-
-    // Downloads
-    const downloadSec = $('#download-section');
-    if (downloadSec) {
-      const done = job.status === 'completed';
-      downloadSec.hidden = !done;
-      if (done) {
-        $$('#download-section [data-kind]').forEach(a => {
-          a.href = `/api/jobs/${job.id}/download/${a.dataset.kind}`;
-        });
-      }
+  form.addEventListener('submit', async e => {
+    e.preventDefault();
+    submitBtn.disabled = true;
+    submitBtn.textContent = '上傳中…';
+    const data = new FormData(form);
+    ['adaptive_retry', 'clahe', 'reflow', 'two_column', 'furigana', 'homoglyphs'].forEach(k => {
+      data.set(k, String(form.elements[k].checked));
+    });
+    try {
+      const res = await fetch('/api/jobs', { method: 'POST', body: data });
+      if (!res.ok) throw new Error(await errorMessage(res, '建立工作失敗'));
+      const body = await res.json();
+      form.reset();
+      fileInput.dispatchEvent(new Event('change'));
+      $('#custom-range-box').hidden = true;
+      location.hash = body.id;
+    } catch (err) {
+      showToast(`無法建立工作：${err.message}`, 'danger');
+      submitBtn.disabled = !fileInput.files?.length;
+    } finally {
+      submitBtn.textContent = '開始辨識';
     }
+  });
 
-    // Workbench visibility
-    const wb = $('#workbench');
-    if (wb) wb.hidden = false;
-
-    // Refresh pages metadata and load page
-    loadJobPagesList();
-  }
-
-  // 7. Pages Metadata & Workbench Loading
-  async function loadJobPagesList() {
+  // ---------- Job header & polling ----------
+  $('#cancel-btn').addEventListener('click', async () => {
     if (!currentJobId) return;
     try {
-      const res = await fetch(`/api/jobs/${currentJobId}/pages`);
-      if (res.ok) {
-        jobPages = await res.json();
+      const res = await fetch(`/api/jobs/${currentJobId}/cancel`, { method: 'POST' });
+      if (!res.ok) throw new Error(await errorMessage(res, '停止要求送出失敗'));
+      renderJobHeader(await res.json());
+      showToast('已要求停止，已完成的頁面會保留', 'info');
+    } catch (err) {
+      showToast(err.message || '停止要求送出失敗', 'danger');
+    }
+  });
+
+  function renderJobHeader(job) {
+    currentJob = job;
+    const active = ['queued', 'running'].includes(job.status);
+    $('#job-title').textContent = job.filename || '未命名文件';
+    document.title = `${job.filename || '校對'} · AuraDoc`;
+    const pill = $('#job-status-badge');
+    pill.textContent = STATUS_LABELS[job.status] || job.status;
+    pill.className = `status-pill status-${job.status}`;
+    $('#status-msg').textContent = active || job.status === 'failed' ? (job.message || '') : `${backendLabel(job)} · ${job.pages[0]}–${job.pages[1]} 頁`;
+    $('#progress-wrap').hidden = !active;
+    $('#progress').value = job.progress || 0;
+    $('#progress-percent').textContent = `${job.progress || 0}%`;
+    $('#cancel-btn').hidden = !active;
+    const done = job.status === 'completed' || job.status === 'cancelled';
+    $('#download-section').hidden = !done;
+    $$('#download-section [data-kind]').forEach(a => {
+      a.href = `/api/jobs/${job.id}/download/${a.dataset.kind}`;
+    });
+    $('#page-total').textContent = `/ ${job.pages[1]}`;
+    $('#page-jump-input').min = job.pages[0];
+    $('#page-jump-input').max = job.pages[1];
+  }
+
+  async function pollJob() {
+    clearTimeout(pollTimer);
+    const id = currentJobId;
+    if (!id) return;
+    try {
+      const res = await fetch(`/api/jobs/${id}`);
+      if (res.status === 404) {
+        showToast('找不到這個工作', 'danger');
+        location.hash = '';
+        return;
       }
+      if (!res.ok) throw new Error();
+      const job = await res.json();
+      if (id !== currentJobId) return;
+      renderJobHeader(job);
+      await refreshPagesList();
+      if (currentPage === null) currentPage = job.pages[0];
+      if (loadedPage !== currentPage || !currentPageData) await loadCurrentPage();
+      if (['queued', 'running'].includes(job.status)) pollTimer = setTimeout(pollJob, 1200);
     } catch {
-      jobPages = [];
+      pollTimer = setTimeout(pollJob, 2500);
     }
+  }
 
+  async function refreshPagesList() {
+    try {
+      const res = await fetch(`/api/jobs/${currentJobId}/pages`);
+      if (res.ok) jobPages = await res.json();
+    } catch { /* keep previous list */ }
     renderMinimap();
+    updateNavButtons();
+  }
 
-    if (!currentPage && currentJob && currentJob.pages) {
-      currentPage = currentJob.pages[0];
-    }
+  // ---------- Page loading ----------
+  function goToPage(page) {
+    if (page === currentPage && loadedPage === page) return;
+    if (!confirmDiscardEdits()) return;
+    exitEditMode();
+    currentPage = page;
     loadCurrentPage();
   }
 
   async function loadCurrentPage() {
-    if (!currentJobId || !currentPage) return;
+    if (!currentJobId || currentPage === null) return;
     const pageNum = currentPage;
-
-    $('#page-label').textContent = `第 ${pageNum} 頁（共 ${currentJob?.pages?.[1] || '?'} 頁）`;
-    const jumpInput = $('#page-jump-input');
-    if (jumpInput) jumpInput.value = pageNum;
-
-    $('#original-img').src = `/api/jobs/${currentJobId}/pages/${pageNum}/original`;
-
-    // Fetch single page JSON
+    const jump = $('#page-jump-input');
+    // Polling reloads a still-processing page every tick: don't wipe what the user
+    // is typing in the jump box, and don't disarm a rerun they're confirming.
+    if (loadedPage !== pageNum || document.activeElement !== jump) jump.value = pageNum;
+    if (loadedPage !== pageNum) disarmRerun();
+    const img = $('#original-img');
+    const src = `/api/jobs/${currentJobId}/pages/${pageNum}/original`;
+    if (!img.src.endsWith(src)) img.src = src;
     try {
       const res = await fetch(`/api/jobs/${currentJobId}/pages/${pageNum}`);
-      if (!res.ok) throw new Error('該頁尚未產生');
-      currentPageData = await res.json();
-      renderPageDetails(currentPageData);
+      if (!res.ok) throw new Error('這一頁還在辨識中…');
+      const data = await res.json();
+      if (pageNum !== currentPage) return;
+      currentPageData = data;
+      loadedPage = pageNum;
+      renderPageDetails(data);
     } catch (err) {
+      if (pageNum !== currentPage) return;
       currentPageData = null;
+      loadedPage = null;
       renderEmptyPage(err.message);
     }
-
-    updateNavButtons();
     renderMinimap();
+    updateNavButtons();
   }
 
   function renderPageDetails(data) {
-    // Type badge
-    const badge = $('#page-type-badge');
-    badge.textContent = PAGE_TYPE_LABELS[data.page_type] || data.page_type || '一般';
+    $('#page-type-badge').textContent = PAGE_TYPE_LABELS[data.page_type] || data.page_type || '—';
+    updateReviewButton();
 
-    // Review status button
-    const btnReview = $('#btn-toggle-reviewed');
-    const labelReview = $('#label-toggle-reviewed');
-    if (btnReview && labelReview) {
-      const isReviewed = Boolean(data.reviewed);
-      btnReview.classList.toggle('is-reviewed', isReviewed);
-      labelReview.textContent = isReviewed ? '已確認 (Space 取消)' : '標記已確認 (Space)';
-    }
-
-    // Review reasons
-    const container = $('#review-reasons-container');
-    container.innerHTML = '';
-    const reasons = data.review_reasons || [];
-    if (reasons.length === 0 && !data.needs_review) {
-      const span = document.createElement('span');
-      span.className = 'type-badge';
-      span.style.color = '#34d399';
-      span.innerHTML = `${SVG_ICONS.check} 品質良好`;
-      container.appendChild(span);
+    const reasons = $('#review-reasons-container');
+    reasons.textContent = '';
+    const list = data.review_reasons || [];
+    if (!list.length && !data.needs_review) {
+      const ok = document.createElement('span');
+      ok.className = 'reason ok';
+      ok.textContent = '辨識品質良好';
+      reasons.appendChild(ok);
     } else {
-      reasons.forEach(r => {
+      list.forEach(r => {
         const tag = document.createElement('span');
-        tag.className = 'reason-tag';
-        tag.innerHTML = `${SVG_ICONS.warning} ${REVIEW_REASON_LABELS[r] || r}`;
-        container.appendChild(tag);
+        tag.className = 'reason';
+        tag.textContent = REVIEW_REASON_LABELS[r] || r;
+        reasons.appendChild(tag);
       });
     }
 
-    // Clean text view
     const cleanView = $('#clean-view');
-    cleanView.innerHTML = '';
-    const lines = (data.clean || '').split('\n');
-    lines.forEach((lineText, idx) => {
-      const lineSpan = document.createElement('div');
-      lineSpan.className = 'text-line';
-      lineSpan.dataset.lineIdx = idx;
-      lineSpan.textContent = lineText || ' ';
-      lineSpan.addEventListener('mouseenter', () => highlightMatchingSvgBox(idx));
-      lineSpan.addEventListener('mouseleave', () => clearSvgBoxHighlight());
-      cleanView.appendChild(lineSpan);
-    });
-
-    // Clean Editor
-    const editor = $('#clean-editor');
-    if (editor) editor.value = data.clean || '';
-
-    // Raw text view
-    const rawView = $('#raw-view');
-    if (rawView) rawView.textContent = data.raw || '無原始識別文字。';
-
-    // Diff view
-    renderDiffView(data.raw || '', data.clean || '');
-
-    // Render SVG Bounding Boxes Overlay
+    cleanView.textContent = '';
+    const text = data.clean || '';
+    if (!text.trim()) {
+      cleanView.innerHTML = '<p class="empty">這一頁沒有可整理的文字。</p>';
+    } else {
+      text.split('\n').forEach((lineText, idx) => {
+        const line = document.createElement('div');
+        line.className = 'text-line';
+        line.dataset.lineIdx = idx;
+        line.textContent = lineText || ' ';
+        const sources = data.clean_line_sources?.[idx] || [];
+        line.addEventListener('mouseenter', () => highlightBoxes(sources));
+        line.addEventListener('mouseleave', clearBoxHighlight);
+        cleanView.appendChild(line);
+      });
+    }
+    $('#clean-editor').value = text;
+    $('#raw-view').textContent = data.raw || '沒有原始辨識文字。';
+    renderDiffView(data.raw || '', text);
     renderSvgOverlay(data);
   }
 
   function renderEmptyPage(msg) {
-    $('#page-type-badge').textContent = '處理中';
-    $('#review-reasons-container').innerHTML = '';
-    $('#clean-view').textContent = msg || '此頁尚在辨識中…';
-    $('#raw-view').textContent = msg || '此頁尚在辨識中…';
-    $('#diff-view').innerHTML = '<span class="muted">尚無比對資料</span>';
-    const svg = $('#original-svg');
-    if (svg) svg.innerHTML = '';
+    $('#page-type-badge').textContent = '—';
+    $('#review-reasons-container').textContent = '';
+    updateReviewButton();
+    $('#clean-view').innerHTML = '';
+    const p = document.createElement('p');
+    p.className = 'empty';
+    p.textContent = msg;
+    $('#clean-view').appendChild(p);
+    $('#raw-view').textContent = msg;
+    $('#diff-view').textContent = '';
+    $('#original-svg').innerHTML = '';
   }
 
-  // 8. Visual Page Minimap
+  function updateReviewButton() {
+    const btn = $('#btn-toggle-reviewed');
+    const reviewed = Boolean(currentPageData?.reviewed);
+    btn.disabled = !currentPageData;
+    btn.classList.toggle('is-reviewed', reviewed);
+    $('#label-toggle-reviewed').textContent = reviewed ? '取消確認' : '確認，下一頁';
+    btn.title = reviewed ? '取消本頁的確認（Space）' : '確認本頁並前往下一頁（Space）';
+  }
+
+  // ---------- Minimap ----------
+  // Every page of the requested range: processed ones from the server, the rest as
+  // "waiting" placeholders (previously unprocessed pages vanished once one finished).
+  function pagesInRange() {
+    if (!currentJob) return jobPages;
+    const [a, b] = currentJob.pages;
+    const done = new Map(jobPages.map(p => [p.page, p]));
+    return Array.from({ length: b - a + 1 }, (_, i) => done.get(a + i) || { page: a + i, pending: true });
+  }
+
+  const isPending = p => p.needs_review && !p.reviewed && !p.user_edited;
+
   function renderMinimap() {
     const container = $('#page-minimap');
-    if (!container) return;
-    container.innerHTML = '';
-
-    const pages = jobPages.length ? jobPages : (currentJob?.pages ? Array.from({ length: currentJob.pages[1] - currentJob.pages[0] + 1 }, (_, i) => ({ page: currentJob.pages[0] + i })) : []);
-    let reviewedCount = 0;
-
+    const pages = pagesInRange();
+    const frag = document.createDocumentFragment();
+    let reviewed = 0;
+    let pending = 0;
     pages.forEach(p => {
-      const cell = document.createElement('div');
-      cell.className = 'minimap-cell';
+      const cell = document.createElement('button');
+      cell.type = 'button';
+      cell.className = 'cell';
       cell.textContent = p.page;
-
-      if (p.page === currentPage) {
-        cell.classList.add('cell-current');
-      }
-
-      if (p.reviewed || (p.user_edited && !p.needs_review)) {
-        cell.classList.add('cell-reviewed');
-        reviewedCount++;
-      } else if (p.needs_review) {
-        cell.classList.add('cell-needs-review');
-      } else {
-        cell.classList.add('cell-normal');
-      }
-
-      const ptype = PAGE_TYPE_LABELS[p.page_type] || p.page_type || '';
-      const revStatus = p.reviewed ? ' (已確認)' : (p.needs_review ? ' (待審核)' : '');
-      cell.title = `第 ${p.page} 頁 · ${ptype}${revStatus}`;
-
-      cell.onclick = () => {
-        currentPage = p.page;
-        loadCurrentPage();
-      };
-      container.appendChild(cell);
+      let state = '一般';
+      if (p.pending) { cell.classList.add('cell-waiting'); state = '尚未辨識'; }
+      else if (p.reviewed) { cell.classList.add('cell-reviewed'); state = '已確認'; reviewed++; }
+      else if (p.needs_review) { cell.classList.add('cell-needs-review'); state = '待確認'; pending++; }
+      if (p.page === currentPage) { cell.classList.add('cell-current'); cell.setAttribute('aria-current', 'page'); }
+      const type = PAGE_TYPE_LABELS[p.page_type] || '';
+      cell.setAttribute('aria-label', `第 ${p.page} 頁，${state}${type ? '，' + type : ''}`);
+      cell.title = `第 ${p.page} 頁 · ${state}${type ? ' · ' + type : ''}`;
+      cell.addEventListener('click', () => goToPage(p.page));
+      frag.appendChild(cell);
     });
-
-    const stats = $('#minimap-stats');
-    if (stats && pages.length) {
-      const pct = Math.round((reviewedCount / pages.length) * 100);
-      stats.textContent = `已確認 ${reviewedCount} / ${pages.length} 頁 (${pct}%)`;
+    container.replaceChildren(frag);
+    $('#minimap-stats').textContent = jobPages.length
+      ? (pending ? `待確認 ${pending} 頁 · 已確認 ${reviewed} 頁` : `沒有待確認頁 · 已確認 ${reviewed} 頁`)
+      : '';
+    // Scroll only the strip, and only when the page changed: scrollIntoView on every
+    // 1.2 s poll yanked the minimap (and sometimes the window) back while browsing.
+    const cur = container.querySelector('.cell-current');
+    if (cur && lastScrolledPage !== currentPage) {
+      lastScrolledPage = currentPage;
+      const c = container.getBoundingClientRect();
+      const r = cur.getBoundingClientRect();
+      if (r.left < c.left || r.right > c.right) container.scrollLeft += r.left - c.left - (c.width - r.width) / 2;
+      if (r.top < c.top || r.bottom > c.bottom) container.scrollTop += r.top - c.top - (c.height - r.height) / 2;
     }
   }
 
-  // 9. SVG Overlay Bounding Boxes
+  // ---------- Navigation ----------
+  function filteredPages() {
+    const filter = $('#page-filter').value;
+    const pages = pagesInRange();
+    if (filter === 'all') return pages;
+    if (filter === 'review') return pages.filter(isPending);
+    return pages.filter(p => p.page_type === filter);
+  }
+
+  function neighbour(step) {
+    const list = filteredPages();
+    if (!list.length) return null;
+    const idx = list.findIndex(p => p.page === currentPage);
+    if (idx === -1) {
+      // current page is outside the filter: pick the nearest one in the requested direction
+      const cand = step > 0 ? list.find(p => p.page > currentPage) : [...list].reverse().find(p => p.page < currentPage);
+      return cand ? cand.page : null;
+    }
+    const next = list[idx + step];
+    return next ? next.page : null;
+  }
+
+  function updateNavButtons() {
+    $('#prev-page').disabled = neighbour(-1) === null;
+    $('#next-page').disabled = neighbour(1) === null;
+  }
+
+  function nextPendingPage(after) {
+    const pending = jobPages.filter(isPending);
+    return (pending.find(p => p.page > after) || pending[0])?.page ?? null;
+  }
+
+  $('#prev-page').addEventListener('click', () => { const p = neighbour(-1); if (p !== null) goToPage(p); });
+  $('#next-page').addEventListener('click', () => { const p = neighbour(1); if (p !== null) goToPage(p); });
+
+  $('#jump-next-review').addEventListener('click', () => {
+    const p = nextPendingPage(currentPage);
+    if (p === null) { showToast('沒有待確認的頁面了', 'success'); return; }
+    goToPage(p);
+  });
+
+  $('#page-jump-input').addEventListener('keydown', e => {
+    if (e.key !== 'Enter') return;
+    const val = parseInt(e.target.value, 10);
+    const [a, b] = currentJob?.pages || [1, 1];
+    if (val >= a && val <= b) { goToPage(val); e.target.blur(); }
+    else showToast(`請輸入 ${a} 到 ${b} 之間的頁碼`, 'warning');
+  });
+
+  $('#page-filter').addEventListener('change', () => {
+    const list = filteredPages();
+    updateNavButtons();
+    if (list.length && !list.some(p => p.page === currentPage)) goToPage(list[0].page);
+    else if (!list.length) showToast('沒有符合條件的頁面', 'info');
+  });
+
+  // ---------- Review ----------
+  async function setReviewed(page, reviewed) {
+    const res = await fetch(`/api/jobs/${currentJobId}/pages/${page}/review`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reviewed })
+    });
+    if (!res.ok) throw new Error(await errorMessage(res, '狀態更新失敗'));
+    const updated = await res.json();
+    const entry = jobPages.find(p => p.page === page);
+    if (entry) { entry.reviewed = updated.reviewed; entry.user_edited = Boolean(updated.user_edited); }
+    if (currentPageData && page === currentPage) currentPageData.reviewed = updated.reviewed;
+    return updated;
+  }
+
+  async function toggleReview() {
+    if (!currentPageData || isEditing || reviewInFlight) return;
+    const page = currentPage;
+    reviewInFlight = true;
+    try {
+      if (currentPageData.reviewed) {
+        await setReviewed(page, false);
+        updateReviewButton();
+        renderMinimap();
+        showToast(`第 ${page} 頁已取消確認`, 'info');
+        return;
+      }
+      await setReviewed(page, true);
+      updateReviewButton();
+      renderMinimap();
+      const undo = { label: '復原', onClick: async () => {
+        try {
+          await setReviewed(page, false);
+          goToPage(page);
+          updateReviewButton();
+          renderMinimap();
+        } catch (err) { showToast(`復原失敗：${err.message}`, 'danger'); }
+      } };
+      const target = nextPendingPage(page);
+      if (target !== null) {
+        showToast(`第 ${page} 頁已確認`, 'success', undo);
+        goToPage(target);
+      } else {
+        if (!allDoneAnnounced) {
+          allDoneAnnounced = true;
+          showToast('全部頁面已確認', 'success', undo);
+        } else {
+          showToast(`第 ${page} 頁已確認`, 'success', undo);
+        }
+        const next = neighbour(1);
+        if (next !== null) goToPage(next);
+      }
+    } catch (err) {
+      showToast(`無法更新：${err.message}`, 'danger');
+    } finally {
+      reviewInFlight = false;
+    }
+  }
+
+  $('#btn-toggle-reviewed').addEventListener('click', toggleReview);
+
+  // ---------- Editing ----------
+  const cleanView = $('#clean-view');
+  const editor = $('#clean-editor');
+  const btnEdit = $('#btn-edit-clean');
+  const btnSave = $('#btn-save-clean');
+  const btnCancelEdit = $('#btn-cancel-edit');
+
+  const isDirty = () => isEditing && editor.value !== (currentPageData?.clean || '');
+  function confirmDiscardEdits() {
+    return !isDirty() || confirm('有尚未儲存的修改，確定要放棄嗎？');
+  }
+
+  function showTab(name) {
+    $$('.tab-btn').forEach(b => {
+      const on = b.dataset.tab === name;
+      b.classList.toggle('active', on);
+      b.setAttribute('aria-selected', String(on));
+    });
+    $$('.tab-pane').forEach(p => { p.hidden = p.id !== `pane-${name}`; });
+  }
+  $$('.tab-btn').forEach(b => b.addEventListener('click', () => {
+    if (isEditing && b.dataset.tab !== 'clean') return;
+    showTab(b.dataset.tab);
+  }));
+
+  function enterEditMode() {
+    if (!currentPageData || isEditing) return;
+    showTab('clean');
+    isEditing = true;
+    editor.value = currentPageData.clean || '';
+    cleanView.hidden = true;
+    editor.hidden = false;
+    btnEdit.hidden = true;
+    btnSave.hidden = false;
+    btnCancelEdit.hidden = false;
+    $('#view-workbench').classList.add('is-editing');
+    editor.focus();
+  }
+
+  function exitEditMode() {
+    if (!isEditing) return;
+    isEditing = false;
+    cleanView.hidden = false;
+    editor.hidden = true;
+    btnEdit.hidden = false;
+    btnSave.hidden = true;
+    btnCancelEdit.hidden = true;
+    $('#view-workbench').classList.remove('is-editing');
+  }
+
+  async function saveEdit() {
+    if (!isEditing || saveInFlight) return;   // Ctrl+S bypasses the disabled button
+    saveInFlight = true;
+    btnSave.disabled = true;
+    try {
+      const res = await fetch(`/api/jobs/${currentJobId}/pages/${currentPage}/clean`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clean: editor.value })
+      });
+      if (!res.ok) throw new Error(await errorMessage(res, '儲存失敗'));
+      currentPageData = await res.json();
+      exitEditMode();
+      renderPageDetails(currentPageData);
+      await refreshPagesList();
+      showToast('已儲存，本頁同時標記為已確認', 'success');
+    } catch (err) {
+      showToast(`儲存失敗：${err.message}`, 'danger');
+    } finally {
+      saveInFlight = false;
+      btnSave.disabled = false;
+    }
+  }
+
+  btnEdit.addEventListener('click', enterEditMode);
+  btnSave.addEventListener('click', saveEdit);
+  btnCancelEdit.addEventListener('click', () => { if (confirmDiscardEdits()) exitEditMode(); });
+
+  // ---------- Rerun (two-step) ----------
+  const btnRerun = $('#btn-rerun-page');
+  function disarmRerun() {
+    clearTimeout(rerunArmed);
+    rerunArmed = null;
+    btnRerun.classList.remove('armed');
+    $('#label-rerun').textContent = '重新辨識';
+  }
+  btnRerun.addEventListener('click', async () => {
+    if (!currentJobId || currentPage === null) return;
+    if (!rerunArmed) {
+      btnRerun.classList.add('armed');
+      $('#label-rerun').textContent = currentPageData?.user_edited ? '會覆蓋你的修改，再按一次' : '再按一次確認';
+      rerunArmed = setTimeout(disarmRerun, 4000);
+      return;
+    }
+    disarmRerun();
+    if (!confirmDiscardEdits()) return;
+    exitEditMode();
+    const page = currentPage;
+    btnRerun.disabled = true;
+    $('#label-rerun').textContent = '辨識中…';
+    try {
+      const res = await fetch(`/api/jobs/${currentJobId}/pages/${page}/rerun`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
+      });
+      if (!res.ok) throw new Error(await errorMessage(res, '重新辨識失敗'));
+      const updated = await res.json();
+      if (page === currentPage) { currentPageData = updated; renderPageDetails(updated); }
+      await refreshPagesList();
+      showToast(`第 ${page} 頁已重新辨識`, 'success');
+    } catch (err) {
+      showToast(err.message, 'danger');
+    } finally {
+      btnRerun.disabled = false;
+      $('#label-rerun').textContent = '重新辨識';
+    }
+  });
+
+  // ---------- Overlay & sync highlight ----------
+  $('#toggle-overlay').addEventListener('change', e => {
+    $('#original-svg').style.display = e.target.checked ? '' : 'none';
+  });
+
   function renderSvgOverlay(data) {
     const svg = $('#original-svg');
-    if (!svg) return;
     svg.innerHTML = '';
-
     const lines = data.source_lines || [];
-    if (lines.length === 0) return;
-
-    let pw = data.page_width;
-    let ph = data.page_height;
+    if (!lines.length) return;
+    let pw = data.page_width, ph = data.page_height;
     if (!pw || !ph) {
       pw = Math.max(...lines.map(l => (l.bbox ? l.bbox[2] : 1000)), 1000);
       ph = Math.max(...lines.map(l => (l.bbox ? l.bbox[3] : 1400)), 1400);
     }
     svg.setAttribute('viewBox', `0 0 ${pw} ${ph}`);
-
     lines.forEach((line, idx) => {
       if (!line.bbox) return;
       const [x1, y1, x2, y2] = line.bbox;
@@ -440,611 +707,235 @@
       rect.setAttribute('width', Math.max(x2 - x1, 4));
       rect.setAttribute('height', Math.max(y2 - y1, 4));
       rect.dataset.lineIdx = idx;
-
-      if (line.included_in_clean === false) {
-        rect.classList.add('bbox-filtered');
-      } else if (line.needs_review) {
-        rect.classList.add('bbox-review');
-      } else {
-        rect.classList.add('bbox-clean');
-      }
-
+      rect.classList.add(line.included_in_clean === false ? 'bbox-filtered' : (line.needs_review ? 'bbox-review' : 'bbox-clean'));
       const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
-      const reasons = line.review_reasons?.map(r => REVIEW_REASON_LABELS[r] || r).join(', ');
-      title.textContent = `${line.text}\n${line.filter_reason ? '過濾原因: ' + line.filter_reason : (reasons ? '待確認: ' + reasons : '信心度: ' + Math.round((line.confidence || 0) * 100) + '%')}`;
+      const reasons = (line.review_reasons || []).map(r => REVIEW_REASON_LABELS[r] || r).join('、');
+      title.textContent = `${line.text}\n${line.filter_reason ? '已略過：' + line.filter_reason
+        : reasons ? '需留意：' + reasons : '信心度 ' + Math.round((line.confidence || 0) * 100) + '%'}`;
       rect.appendChild(title);
-
-      rect.addEventListener('mouseenter', () => {
-        rect.classList.add('active');
-        highlightMatchingTextLine(idx);
-      });
-      rect.addEventListener('mouseleave', () => {
-        rect.classList.remove('active');
-        clearTextLineHighlight();
-      });
-      rect.addEventListener('click', () => {
-        scrollTextLineIntoView(idx);
-      });
-
+      rect.addEventListener('mouseenter', () => { rect.classList.add('active'); highlightLines(idx, data.clean_line_sources); });
+      rect.addEventListener('mouseleave', () => { rect.classList.remove('active'); clearLineHighlight(); });
+      rect.addEventListener('click', () => scrollLineIntoView(idx, data.clean_line_sources));
       svg.appendChild(rect);
     });
   }
 
-  function highlightMatchingSvgBox(idx) {
-    const rect = $(`#original-svg rect[data-line-idx="${idx}"]`);
-    if (rect) rect.classList.add('active');
+  function highlightBoxes(indices) {
+    indices.forEach(i => $(`#original-svg rect[data-line-idx="${i}"]`)?.classList.add('active'));
   }
-
-  function clearSvgBoxHighlight() {
+  function clearBoxHighlight() {
     $$('#original-svg rect.active').forEach(r => r.classList.remove('active'));
   }
-
-  function highlightMatchingTextLine(idx) {
-    const line = $(`#clean-view .text-line[data-line-idx="${idx}"]`);
-    if (line) line.classList.add('active');
+  function linesForSource(sourceIdx, mapping) {
+    if (!Array.isArray(mapping)) return [];
+    return mapping.flatMap((sources, i) => (sources?.includes(sourceIdx) ? [i] : []));
   }
-
-  function clearTextLineHighlight() {
+  function highlightLines(sourceIdx, mapping) {
+    linesForSource(sourceIdx, mapping).forEach(i => $(`#clean-view .text-line[data-line-idx="${i}"]`)?.classList.add('active'));
+  }
+  function clearLineHighlight() {
     $$('#clean-view .text-line.active').forEach(l => l.classList.remove('active'));
   }
-
-  function scrollTextLineIntoView(idx) {
-    const line = $(`#clean-view .text-line[data-line-idx="${idx}"]`);
-    if (line) {
-      line.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      line.classList.add('active');
-      setTimeout(() => line.classList.remove('active'), 1500);
-    }
+  function scrollLineIntoView(sourceIdx, mapping) {
+    const i = linesForSource(sourceIdx, mapping)[0];
+    if (i === undefined) return;
+    showTab('clean');
+    const line = $(`#clean-view .text-line[data-line-idx="${i}"]`);
+    if (!line) return;
+    line.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    line.classList.add('active');
+    setTimeout(() => line.classList.remove('active'), 1500);
   }
 
-  // Toggle SVG Overlay
-  const toggleOverlay = $('#toggle-overlay');
-  if (toggleOverlay) {
-    toggleOverlay.addEventListener('change', () => {
-      const svg = $('#original-svg');
-      if (svg) svg.style.display = toggleOverlay.checked ? 'block' : 'none';
-    });
+  // ---------- Zoom & pan ----------
+  const viewport = $('#original-viewport');
+  const canvas = $('#original-container');
+  function applyTransform() {
+    canvas.style.transform = `translate(${panX}px, ${panY}px) scale(${zoomScale})`;
+    $('#zoom-level').textContent = `${Math.round(zoomScale * 100)}%`;
   }
-
-  // Toggle Collapse Original Image on Mobile
-  const toggleCollapseBtn = $('#toggle-collapse-img');
-  if (toggleCollapseBtn) {
-    toggleCollapseBtn.addEventListener('click', () => {
-      const vp = $('#original-viewport');
-      if (vp) {
-        const isHidden = vp.style.display === 'none';
-        vp.style.display = isHidden ? 'block' : 'none';
-        toggleCollapseBtn.textContent = isHidden ? '收合原圖' : '展開原圖';
-      }
-    });
+  function resetZoom() { zoomScale = 1; panX = 0; panY = 0; applyTransform(); }
+  function zoomAt(factor, cx, cy) {
+    const next = Math.max(0.5, Math.min(4, zoomScale * factor));
+    panX = cx - (cx - panX) * (next / zoomScale);
+    panY = cy - (cy - panY) * (next / zoomScale);
+    zoomScale = next;
+    applyTransform();
   }
+  viewport.addEventListener('wheel', e => {
+    e.preventDefault();
+    const r = viewport.getBoundingClientRect();
+    zoomAt(e.deltaY < 0 ? 1.15 : 1 / 1.15, e.clientX - r.left, e.clientY - r.top);
+  }, { passive: false });
+  viewport.addEventListener('mousedown', e => {
+    if (e.button !== 0 || e.target.tagName === 'rect') return;
+    isPanning = true;
+    panStartX = e.clientX - panX;
+    panStartY = e.clientY - panY;
+    viewport.classList.add('panning');
+  });
+  window.addEventListener('mousemove', e => {
+    if (!isPanning) return;
+    panX = e.clientX - panStartX;
+    panY = e.clientY - panStartY;
+    applyTransform();
+  });
+  window.addEventListener('mouseup', () => { isPanning = false; viewport.classList.remove('panning'); });
+  viewport.addEventListener('dblclick', resetZoom);
+  $('#zoom-level').addEventListener('click', resetZoom);
+  $('#btn-zoom-in').addEventListener('click', () => zoomAt(1.25, viewport.clientWidth / 2, viewport.clientHeight / 2));
+  $('#btn-zoom-out').addEventListener('click', () => zoomAt(0.8, viewport.clientWidth / 2, viewport.clientHeight / 2));
 
-  // 10. Pan & Zoom Engine for Original Canvas
-  const originalViewport = $('#original-viewport');
-  const originalContainer = $('#original-container');
-  const zoomLevelIndicator = $('#zoom-level');
-
-  function updateCanvasTransform() {
-    if (originalContainer) {
-      originalContainer.style.transform = `translate(${panX}px, ${panY}px) scale(${zoomScale})`;
-    }
-    if (zoomLevelIndicator) {
-      zoomLevelIndicator.textContent = `${Math.round(zoomScale * 100)}%`;
-    }
-  }
-
-  if (originalViewport && originalContainer) {
-    // Wheel Zoom
-    originalViewport.addEventListener('wheel', e => {
-      e.preventDefault();
-      const rect = originalViewport.getBoundingClientRect();
-      const mouseX = e.clientX - rect.left;
-      const mouseY = e.clientY - rect.top;
-
-      const factor = e.deltaY < 0 ? 1.15 : 0.87;
-      const newScale = Math.max(0.4, Math.min(4.0, zoomScale * factor));
-
-      // Zoom towards cursor
-      panX = mouseX - (mouseX - panX) * (newScale / zoomScale);
-      panY = mouseY - (mouseY - panY) * (newScale / zoomScale);
-      zoomScale = newScale;
-
-      updateCanvasTransform();
-    }, { passive: false });
-
-    // Drag Pan
-    originalViewport.addEventListener('mousedown', e => {
-      // Don't drag if clicking directly on a selectable bounding box
-      if (e.target.tagName === 'rect') return;
-      isPanning = true;
-      panStartX = e.clientX - panX;
-      panStartY = e.clientY - panY;
-      originalViewport.classList.add('panning');
-    });
-
-    window.addEventListener('mousemove', e => {
-      if (!isPanning) return;
-      panX = e.clientX - panStartX;
-      panY = e.clientY - panStartY;
-      updateCanvasTransform();
-    });
-
-    window.addEventListener('mouseup', () => {
-      if (isPanning) {
-        isPanning = false;
-        originalViewport.classList.remove('panning');
-      }
-    });
-
-    // Zoom Buttons
-    $('#btn-zoom-in')?.addEventListener('click', () => {
-      zoomScale = Math.min(4.0, zoomScale * 1.25);
-      updateCanvasTransform();
-    });
-
-    $('#btn-zoom-out')?.addEventListener('click', () => {
-      zoomScale = Math.max(0.4, zoomScale / 1.25);
-      updateCanvasTransform();
-    });
-
-    $('#btn-zoom-reset')?.addEventListener('click', () => {
-      zoomScale = 1.0;
-      panX = 0;
-      panY = 0;
-      updateCanvasTransform();
-    });
-
-    $('#btn-zoom-fit')?.addEventListener('click', () => {
-      zoomScale = 1.0;
-      panX = 0;
-      panY = 0;
-      updateCanvasTransform();
-    });
-  }
-
-  // 11. Diff View Rendering
+  // ---------- Diff ----------
   function renderDiffView(rawText, cleanText) {
-    const diffView = $('#diff-view');
-    if (!diffView) return;
-    diffView.innerHTML = '';
-
-    const rawLines = rawText.split('\n').map(s => s.trim()).filter(Boolean);
-    const cleanLines = cleanText.split('\n').map(s => s.trim()).filter(Boolean);
-
-    const maxLen = Math.max(rawLines.length, cleanLines.length);
-    for (let i = 0; i < maxLen; i++) {
-      const r = rawLines[i] || '';
-      const c = cleanLines[i] || '';
-
-      if (r === c) {
-        const d = document.createElement('div');
-        d.className = 'diff-line diff-same';
-        d.textContent = `  ${c}`;
-        diffView.appendChild(d);
-      } else {
-        if (r) {
-          const dDel = document.createElement('div');
-          dDel.className = 'diff-line diff-del';
-          dDel.textContent = `- [Raw]   ${r}`;
-          diffView.appendChild(dDel);
-        }
-        if (c) {
-          const dAdd = document.createElement('div');
-          dAdd.className = 'diff-line diff-add';
-          dAdd.textContent = `+ [Clean] ${c}`;
-          diffView.appendChild(dAdd);
-        }
+    const view = $('#diff-view');
+    view.textContent = '';
+    const raw = rawText.split('\n').map(s => s.trim()).filter(Boolean);
+    const clean = cleanText.split('\n').map(s => s.trim()).filter(Boolean);
+    const add = (cls, text) => {
+      const d = document.createElement('div');
+      d.className = `diff-line ${cls}`;
+      d.textContent = text;
+      view.appendChild(d);
+    };
+    for (let i = 0; i < Math.max(raw.length, clean.length); i++) {
+      const r = raw[i] || '', c = clean[i] || '';
+      if (r === c) add('diff-same', c);
+      else {
+        if (r) add('diff-del', r);
+        if (c) add('diff-add', c);
       }
     }
+    if (!view.childElementCount) add('diff-same', '沒有差異');
   }
 
-  // 12. Tabs Switching (Clean / Raw / Diff)
-  $$('.tab-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      $$('.tab-btn').forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
-      const target = btn.dataset.tab;
+  // ---------- Shortcuts modal ----------
+  const modal = $('#shortcuts-modal');
+  let modalReturnFocus = null;
+  function openModal() { modalReturnFocus = document.activeElement; modal.hidden = false; $('#modal-close').focus(); }
+  function closeModal() { modal.hidden = true; modalReturnFocus?.focus?.(); }
+  $('#btn-shortcuts-help').addEventListener('click', openModal);
+  $('#modal-close').addEventListener('click', closeModal);
+  modal.addEventListener('click', e => { if (e.target === modal) closeModal(); });
 
-      $$('.tab-pane').forEach(p => p.hidden = true);
-      const pane = $(`#pane-${target}`);
-      if (pane) pane.hidden = false;
-    });
-  });
-
-  // 13. Clean Text In-Place Editing
-  const btnEdit = $('#btn-edit-clean');
-  const btnSave = $('#btn-save-clean');
-  const cleanView = $('#clean-view');
-  const cleanEditor = $('#clean-editor');
-  const labelEdit = $('#label-edit-clean');
-
-  if (btnEdit && btnSave && cleanView && cleanEditor) {
-    btnEdit.addEventListener('click', () => {
-      isEditing = !isEditing;
-      if (isEditing) {
-        cleanView.hidden = true;
-        cleanEditor.hidden = false;
-        if (labelEdit) labelEdit.textContent = '取消編輯';
-        btnSave.hidden = false;
-        cleanEditor.focus();
-      } else {
-        cleanView.hidden = false;
-        cleanEditor.hidden = true;
-        if (labelEdit) labelEdit.textContent = '編輯 (E)';
-        btnSave.hidden = true;
-      }
-    });
-
-    btnSave.addEventListener('click', async () => {
-      if (!currentJobId || !currentPage) return;
-      btnSave.disabled = true;
-      try {
-        const res = await fetch(`/api/jobs/${currentJobId}/pages/${currentPage}/clean`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ clean: cleanEditor.value })
-        });
-        if (!res.ok) throw new Error('儲存失敗');
-        const updated = await res.json();
-        currentPageData = updated;
-        renderPageDetails(updated);
-        renderMinimap();
-
-        isEditing = false;
-        cleanView.hidden = false;
-        cleanEditor.hidden = true;
-        if (labelEdit) labelEdit.textContent = '編輯 (E)';
-        btnSave.hidden = true;
-        showToast('修改已儲存並自動標記為已確認！', 'success');
-      } catch (err) {
-        showToast(`儲存修改失敗：${err.message}`, 'danger');
-      } finally {
-        btnSave.disabled = false;
-      }
-    });
-  }
-
-  // 14. Toggle Page Review Status
-  async function toggleCurrentPageReview(autoJump = false) {
-    if (!currentJobId || !currentPage || !currentPageData) return;
-    const nextState = !currentPageData.reviewed;
-    try {
-      const res = await fetch(`/api/jobs/${currentJobId}/pages/${currentPage}/review`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ reviewed: nextState })
-      });
-      if (!res.ok) throw new Error('狀態更新失敗');
-      const updated = await res.json();
-      currentPageData.reviewed = updated.reviewed;
-      const targetInList = jobPages.find(p => p.page === currentPage);
-      if (targetInList) targetInList.reviewed = updated.reviewed;
-
-      renderPageDetails(currentPageData);
-      renderMinimap();
-
-      if (nextState) {
-        showToast(`第 ${currentPage} 頁已標記為確認！`, 'success');
-        if (autoJump) {
-          const nextReview = jobPages.find(p => p.needs_review && !p.reviewed && p.page > currentPage) ||
-                             jobPages.find(p => p.needs_review && !p.reviewed);
-          if (nextReview) {
-            currentPage = nextReview.page;
-            loadCurrentPage();
-          } else {
-            $('#next-page')?.click();
-          }
-        }
-      } else {
-        showToast(`第 ${currentPage} 頁已取消確認標記。`, 'info');
-      }
-    } catch (err) {
-      showToast(`標記失敗：${err.message}`, 'danger');
-    }
-  }
-
-  $('#btn-toggle-reviewed')?.addEventListener('click', () => toggleCurrentPageReview(false));
-
-  // 15. Single Page Rerun
-  const btnRerun = $('#btn-rerun-page');
-  if (btnRerun) {
-    btnRerun.addEventListener('click', async () => {
-      if (!currentJobId || !currentPage) return;
-      if (!confirm(`確定要重新執行第 ${currentPage} 頁的辨識與排版嗎？`)) return;
-      btnRerun.disabled = true;
-      btnRerun.textContent = '處理中…';
-      try {
-        const res = await fetch(`/api/jobs/${currentJobId}/pages/${currentPage}/rerun`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({})
-        });
-        if (!res.ok) throw new Error('單頁重新執行失敗');
-        const updated = await res.json();
-        currentPageData = updated;
-        renderPageDetails(updated);
-        renderMinimap();
-        showToast(`第 ${currentPage} 頁已重新辨識完成！`, 'success');
-      } catch (err) {
-        showToast(`重跑失敗：${err.message}`, 'danger');
-      } finally {
-        btnRerun.disabled = false;
-        btnRerun.innerHTML = `<svg class="ui-icon" viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg> 重跑本頁`;
-      }
-    });
-  }
-
-  // 16. Page Jump Input
-  const jumpInput = $('#page-jump-input');
-  if (jumpInput) {
-    jumpInput.addEventListener('keydown', e => {
-      if (e.key === 'Enter') {
-        const val = parseInt(jumpInput.value, 10);
-        if (val >= 1 && currentJob?.pages && val >= currentJob.pages[0] && val <= currentJob.pages[1]) {
-          currentPage = val;
-          loadCurrentPage();
-        } else {
-          showToast(`頁碼必須介於 ${currentJob?.pages?.[0] || 1} 至 ${currentJob?.pages?.[1] || '?'} 之間`, 'warning');
-        }
-      }
-    });
-  }
-
-  // 17. Navigation & Filtering
-  function getFilteredPages() {
-    const filter = $('#page-filter')?.value || 'all';
-    if (!jobPages.length && currentJob?.pages) {
-      const arr = [];
-      for (let i = currentJob.pages[0]; i <= currentJob.pages[1]; i++) arr.push({ page: i, needs_review: false });
-      return arr;
-    }
-    if (filter === 'all') return jobPages;
-    if (filter === 'review') return jobPages.filter(p => p.needs_review && !p.reviewed);
-    return jobPages.filter(p => p.page_type === filter);
-  }
-
-  function updateNavButtons() {
-    const list = getFilteredPages();
-    const curIdx = list.findIndex(p => p.page === currentPage);
-    const prevBtn = $('#prev-page');
-    const nextBtn = $('#next-page');
-
-    if (prevBtn) prevBtn.disabled = curIdx <= 0;
-    if (nextBtn) nextBtn.disabled = curIdx < 0 || curIdx >= list.length - 1;
-  }
-
-  $('#prev-page')?.addEventListener('click', () => {
-    const list = getFilteredPages();
-    const curIdx = list.findIndex(p => p.page === currentPage);
-    if (curIdx > 0) {
-      currentPage = list[curIdx - 1].page;
-      loadCurrentPage();
-    }
-  });
-
-  $('#next-page')?.addEventListener('click', () => {
-    const list = getFilteredPages();
-    const curIdx = list.findIndex(p => p.page === currentPage);
-    if (curIdx >= 0 && curIdx < list.length - 1) {
-      currentPage = list[curIdx + 1].page;
-      loadCurrentPage();
-    }
-  });
-
-  // Jump to Next Review Page
-  $('#jump-next-review')?.addEventListener('click', () => {
-    const pendingReviewPages = jobPages.filter(p => p.needs_review && !p.reviewed);
-    if (!pendingReviewPages.length) {
-      showToast('目前沒有待確認的頁面！', 'success');
-      return;
-    }
-    const next = pendingReviewPages.find(p => p.page > currentPage) || pendingReviewPages[0];
-    currentPage = next.page;
-    loadCurrentPage();
-    showToast(`已跳轉至待確認第 ${currentPage} 頁`, 'info');
-  });
-
-  $('#page-filter')?.addEventListener('change', () => {
-    const list = getFilteredPages();
-    if (list.length > 0 && !list.some(p => p.page === currentPage)) {
-      currentPage = list[0].page;
-    }
-    loadCurrentPage();
-  });
-
-  // 18. Shortcuts Modal Controls
-  const shortcutsModal = $('#shortcuts-modal');
-  const btnHelp = $('#btn-shortcuts-help');
-  const btnCloseModal = $('#modal-close');
-
-  function openShortcutsModal() {
-    if (shortcutsModal) shortcutsModal.hidden = false;
-  }
-  function closeShortcutsModal() {
-    if (shortcutsModal) shortcutsModal.hidden = true;
-  }
-
-  btnHelp?.addEventListener('click', openShortcutsModal);
-  btnCloseModal?.addEventListener('click', closeShortcutsModal);
-  shortcutsModal?.addEventListener('click', e => {
-    if (e.target === shortcutsModal) closeShortcutsModal();
-  });
-
-  // 19. Keyboard Shortcuts
+  // ---------- Keyboard ----------
   window.addEventListener('keydown', e => {
-    if (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) {
-      if (e.key === 'Escape') {
-        e.target.blur();
-      }
+    if ($('#view-workbench').hidden) return;
+
+    if (isEditing) {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') { e.preventDefault(); saveEdit(); }
+      else if (e.key === 'Escape') { e.preventDefault(); if (confirmDiscardEdits()) exitEditMode(); }
+      return;
+    }
+    if (!modal.hidden) {
+      if (e.key === 'Escape' || e.key === '?') { e.preventDefault(); closeModal(); }
+      return;
+    }
+    if (e.ctrlKey || e.altKey || e.metaKey) return;
+    const tag = e.target.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+      if (e.key === 'Escape') e.target.blur();
       return;
     }
 
-    if (e.key === '?' || (e.shiftKey && e.key === '/')) {
-      e.preventDefault();
-      if (shortcutsModal) {
-        shortcutsModal.hidden ? openShortcutsModal() : closeShortcutsModal();
-      }
-      return;
-    }
-
-    if (e.key === 'Escape') {
-      if (shortcutsModal && !shortcutsModal.hidden) {
-        closeShortcutsModal();
-        return;
-      }
-    }
-
-    if (e.key === 'ArrowLeft') {
-      e.preventDefault();
-      $('#prev-page')?.click();
-    } else if (e.key === 'ArrowRight') {
-      e.preventDefault();
-      $('#next-page')?.click();
-    } else if (e.key === 'j' || e.key === 'J') {
-      e.preventDefault();
-      $('#jump-next-review')?.click();
-    } else if (e.key === 'e' || e.key === 'E') {
-      e.preventDefault();
-      $('#btn-edit-clean')?.click();
-    } else if (e.code === 'Space') {
-      e.preventDefault();
-      toggleCurrentPageReview(true);
+    switch (e.key) {
+      case ' ':
+        // Space always means "confirm" here, even when a button has focus.
+        e.preventDefault();
+        if (!e.repeat) toggleReview();
+        break;
+      case 'ArrowLeft': e.preventDefault(); $('#prev-page').click(); break;
+      case 'ArrowRight': e.preventDefault(); $('#next-page').click(); break;
+      case 'j': case 'J': e.preventDefault(); $('#jump-next-review').click(); break;
+      case 'e': case 'E': e.preventDefault(); enterEditMode(); break;
+      case '?': e.preventDefault(); openModal(); break;
+      default: break;
     }
   });
+  // Stop Space from also activating a focused button on keyup.
+  window.addEventListener('keyup', e => {
+    if (e.key === ' ' && !$('#view-workbench').hidden && e.target.tagName === 'BUTTON') e.preventDefault();
+  });
 
-  // 20. Polling
-  async function pollJob() {
-    if (pollTimer) clearTimeout(pollTimer);
-    if (!currentJobId) return;
-
-    try {
-      const res = await fetch(`/api/jobs/${currentJobId}`);
-      if (!res.ok) throw new Error('讀取狀態失敗');
-      const job = await res.json();
-      showJob(job);
-      if (['queued', 'running'].includes(job.status)) {
-        pollTimer = setTimeout(pollJob, 1000);
-      } else {
-        loadHistory();
-      }
-    } catch {
-      pollTimer = setTimeout(pollJob, 2000);
-    }
-  }
-
-  // 21. Recent Jobs List
+  // ---------- History ----------
   async function loadHistory() {
+    clearTimeout(historyTimer);
     try {
       const res = await fetch('/api/jobs?limit=50');
       if (!res.ok) return;
       allHistory = await res.json();
-      renderHistoryList(allHistory);
-    } catch (err) {
-      console.warn('Load history error:', err);
+      renderHistoryList();
+    } catch { /* ignore */ }
+    // Keep running jobs' status/progress fresh on the home view.
+    if (!currentJobId && allHistory.some(j => ['queued', 'running'].includes(j.status))) {
+      historyTimer = setTimeout(loadHistory, 3000);
     }
   }
 
-  function renderHistoryList(jobs) {
+  function renderHistoryList() {
     const container = $('#history-list');
-    if (!container) return;
-    container.innerHTML = '';
-
-    const searchTerm = ($('#history-search')?.value || '').toLowerCase().trim();
-    const filtered = jobs.filter(j => (j.filename || '').toLowerCase().includes(searchTerm));
-
-    if (!filtered.length) {
-      container.innerHTML = '<p class="muted">無相符的工作紀錄。</p>';
+    const term = $('#history-search').value.toLowerCase().trim();
+    const jobs = allHistory.filter(j => (j.filename || '').toLowerCase().includes(term));
+    container.textContent = '';
+    if (!jobs.length) {
+      const p = document.createElement('p');
+      p.className = 'empty';
+      p.textContent = allHistory.length ? '沒有符合的工作。' : '還沒有工作，從左邊上傳第一個 PDF 吧。';
+      container.appendChild(p);
       return;
     }
-
-    filtered.forEach(j => {
+    jobs.forEach(j => {
       const item = document.createElement('div');
       item.className = 'history-item';
 
-      const left = document.createElement('div');
-      left.className = 'history-left';
-
-      const title = document.createElement('h4');
-      title.textContent = j.filename;
-      left.appendChild(title);
-
-      const meta = document.createElement('div');
+      const open = document.createElement('a');
+      open.className = 'history-open';
+      open.href = `#${j.id}`;
+      const name = document.createElement('strong');
+      name.textContent = j.filename;
+      const meta = document.createElement('span');
       meta.className = 'history-meta';
-
-      const statusPill = document.createElement('span');
-      statusPill.className = `status-pill status-${j.status}`;
-      statusPill.textContent = STATUS_LABELS[j.status] || j.status;
-      meta.appendChild(statusPill);
-
-      const pagesSpan = document.createElement('span');
-      pagesSpan.textContent = `頁數: ${j.pages ? j.pages[0] + '–' + j.pages[1] : (j.total_pages || '?')} 頁`;
-      meta.appendChild(pagesSpan);
-
-      const backendSpan = document.createElement('span');
-      backendSpan.textContent = j.backend_actual ? (j.backend_actual.includes('DirectML') ? 'DirectML GPU' : (j.backend_actual.includes('CUDA') ? 'CUDA GPU' : 'CPU')) : (j.backend_requested || 'Auto');
-      meta.appendChild(backendSpan);
-
-      if (typeof j.needs_review_count === 'number' && j.needs_review_count > 0) {
-        const revSpan = document.createElement('span');
-        revSpan.className = 'badge-review';
-        revSpan.textContent = `待確認 ${j.needs_review_count} 頁`;
-        meta.appendChild(revSpan);
+      const pill = document.createElement('span');
+      pill.className = `status-pill status-${j.status}`;
+      pill.textContent = STATUS_LABELS[j.status] || j.status;
+      meta.appendChild(pill);
+      const parts = [
+        j.pages ? `${j.pages[0]}–${j.pages[1]} 頁` : '',
+        backendLabel(j),
+        new Date((j.updated_at || j.created_at) * 1000).toLocaleString('zh-TW', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+      ].filter(Boolean);
+      const info = document.createElement('span');
+      info.textContent = parts.join(' · ');
+      meta.appendChild(info);
+      if (j.needs_review_count > 0) {
+        const rev = document.createElement('span');
+        rev.className = 'pending-count';
+        rev.textContent = `待確認 ${j.needs_review_count}`;
+        meta.appendChild(rev);
       }
+      open.append(name, meta);
+      item.appendChild(open);
 
-      const timeSpan = document.createElement('span');
-      timeSpan.textContent = new Date((j.updated_at || j.created_at) * 1000).toLocaleString('zh-TW', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-      meta.appendChild(timeSpan);
-
-      left.appendChild(meta);
-      item.appendChild(left);
-
-      // Actions
-      const actions = document.createElement('div');
-      actions.className = 'history-actions';
-
-      const openBtn = document.createElement('button');
-      openBtn.className = 'secondary-btn';
-      openBtn.textContent = '開啟工作台';
-      openBtn.onclick = () => {
-        currentJobId = j.id;
-        currentPage = j.pages ? j.pages[0] : 1;
-        history.replaceState(null, '', `#${j.id}`);
-        pollJob();
-        $('#workbench')?.scrollIntoView({ behavior: 'smooth' });
-      };
-      actions.appendChild(openBtn);
-
-      const rerunBtn = document.createElement('button');
-      rerunBtn.className = 'text-btn';
-      rerunBtn.textContent = '沿用參數重跑';
-      rerunBtn.onclick = () => {
-        if (j.backend_requested) {
-          const radio = $(`input[name="backend"][value="${j.backend_requested}"]`);
-          if (radio) radio.checked = true;
-        }
-        if (j.options) {
-          Object.keys(j.options).forEach(k => {
-            if (form.elements[k]) form.elements[k].checked = Boolean(j.options[k]);
-          });
-        }
-        form?.scrollIntoView({ behavior: 'smooth' });
-      };
-      actions.appendChild(rerunBtn);
-
-      item.appendChild(actions);
+      const reuse = document.createElement('button');
+      reuse.type = 'button';
+      reuse.className = 'link-btn';
+      reuse.textContent = '沿用設定';
+      reuse.title = '把這個工作的設定套用到新增辨識表單';
+      reuse.addEventListener('click', () => {
+        const backend = form.querySelector(`input[name="backend"][value="${j.backend_requested}"]`);
+        if (backend) backend.checked = true;
+        Object.entries(j.options || {}).forEach(([k, v]) => { if (form.elements[k]) form.elements[k].checked = Boolean(v); });
+        form.querySelector('details.advanced').open = true;
+        dropZone.focus();
+        showToast('已套用設定，選擇 PDF 後即可開始', 'info');
+      });
+      item.appendChild(reuse);
       container.appendChild(item);
     });
   }
+  $('#history-search').addEventListener('input', renderHistoryList);
 
-  $('#history-search')?.addEventListener('input', () => {
-    renderHistoryList(allHistory);
-  });
-
-  // Initialization
+  // ---------- Init ----------
   loadHardware();
-  loadHistory();
-  if (location.hash) {
-    currentJobId = location.hash.slice(1);
-    pollJob();
-  }
+  route();
 })();

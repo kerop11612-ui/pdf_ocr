@@ -115,6 +115,9 @@ def test_prose_reflow_uses_indent_and_gap_instead_of_closing_quote_alone():
     assert "役立ちます。\n\n次の段落" in result["clean_text"]
     assert result["blocks"][0]["lines"][0]["confidence"] == .99
     assert result["blocks"][0]["lines"][0]["bbox"] == [60, 100, 480, 120]
+    clean_lines = result["clean_text"].split("\n")
+    merged = next(i for i, line in enumerate(clean_lines) if "「中、高級」の学習者" in line)
+    assert result["clean_line_sources"][merged] == [0, 1]
 
 
 def test_toc_is_classified_and_rows_are_not_concatenated():
@@ -129,7 +132,9 @@ def test_toc_is_classified_and_rows_are_not_concatenated():
     ]
     result = process_page_layout(txts, boxes, 600, 800, scores=[.98] * len(txts))
     assert result["page_type"] == "toc"
-    assert "01. 〜が\np.12" in result["clean_text"]
+    assert "01. 〜が p.12" in result["clean_text"]
+    # Left column is read completely before the right column.
+    assert result["clean_text"].index("02. 〜を p.15") < result["clean_text"].index("02 單元 助詞II")
     assert "p.1202." not in result["clean_text"]
     assert result["columns_detected"] == 2
     assert len(result["blocks"]) >= 3
@@ -149,6 +154,34 @@ def test_question_page_and_suspicious_text_are_marked_for_review():
     assert "repeated_character" in result["review_reasons"]
     suspicious = [line for block in result["blocks"] for line in block["lines"] if line["needs_review"]]
     assert suspicious[-1]["text"] == "媽明明明明明②"
+
+
+def test_question_choices_follow_visual_rows_and_keep_source_mapping():
+    txts = ["問題1 次の読み方を選びなさい。", "1", "調査します。", "1 ちょうさ", "2 ちょうさつ", "3 ちょさ", "4 ちょさつ", "2", "種類があります。", "1 しゅれい", "2 じゅれい", "3 しゅるい", "4 じゅるい"]
+    boxes = [
+        _box(40, 60, 520), _box(40, 120, 30), _box(90, 120, 230),
+        _box(90, 160, 95), _box(220, 160, 95), _box(350, 160, 95), _box(480, 160, 95),
+        _box(40, 220, 30), _box(90, 220, 230),
+        _box(90, 260, 95), _box(220, 260, 95), _box(350, 260, 95), _box(480, 260, 95),
+    ]
+    result = process_page_layout(txts, boxes, 600, 800)
+    lines = result["clean_text"].splitlines()
+    assert lines == [
+        "問題1 次の読み方を選びなさい。",
+        "1 調査します。",
+        "1 ちょうさ 2 ちょうさつ 3 ちょさ 4 ちょさつ",
+        "2 種類があります。",
+        "1 しゅれい 2 じゅれい 3 しゅるい 4 じゅるい",
+    ]
+    assert result["clean_line_sources"][4] == [9, 10, 11, 12]
+
+
+def test_question_row_marks_misread_choice_number_for_review():
+    txts = ["問題1 次の読み方を選びなさい。", "1 ちょうさ", "2 ちょうさつ", "35", "4 ちょさつ"]
+    boxes = [_box(40, 60, 520), _box(90, 160, 95), _box(220, 160, 95), _box(350, 160, 95), _box(480, 160, 95)]
+    result = process_page_layout(txts, boxes, 600, 800, scores=[.99] * 5)
+    assert "choice_number_mismatch" in result["source_lines"][3]["review_reasons"]
+    assert "choice_number_mismatch" in result["review_reasons"]
 
 
 def test_vocabulary_card_page_is_distinct_from_prose():
@@ -209,3 +242,108 @@ if __name__ == "__main__":
     test_correct_homoglyphs_and_boundaries()
     test_process_page_layout_reflow_and_two_column()
     print("\n[ALL TEXTBOOK LAYOUT UNIT TESTS PASSED!]")
+
+
+def test_answer_table_rows_keep_answer_next_to_script_and_drop_ruby_noise():
+    # Answer key: circled number | answer digit | script, with ruby under kanji and a small CD-track digit.
+    txts = ["問題I", "① 4", "ふうとう（封筒)", "ふうとう", "② 3", "とけい(時計)", "12", "③ 2", "見ないでくれないかなあ。", "=24", "④ 1", "だいひょう(代表)", "⑤ 1", "さんぎょう(産業)"]
+    boxes = [
+        _box(40, 40, 120, 26),
+        _box(60, 100, 60), _box(160, 100, 300), _box(170, 122, 80, 9),
+        _box(60, 150, 60), _box(160, 150, 300), _box(20, 160, 18, 10),
+        _box(60, 200, 60), _box(160, 200, 300), _box(170, 222, 30, 9),
+        _box(60, 250, 60), _box(160, 250, 300),
+        _box(60, 300, 60), _box(160, 300, 300),
+    ]
+    result = process_page_layout(txts, boxes, 600, 800, scores=[.98] * len(txts))
+    lines = result["clean_text"].splitlines()
+    assert "① 4 ふうとう（封筒)" in lines
+    assert "② 3 とけい(時計)" in lines
+    assert "③ 2 見ないでくれないかなあ。" in lines
+    assert not any(token in result["clean_text"] for token in ("=24", "\nふうとう\n", "\n12\n"))
+    reasons = {line["text"]: line["filter_reason"] for line in result["source_lines"]}
+    assert reasons["ふうとう"] == "furigana"
+    assert reasons["=24"] == "small_fragment"
+
+
+def test_margin_sidebar_notes_are_separated_from_exercise_rows():
+    txts = [
+        "CD1 1番 女の人の答えはどちらの意味ですか。",
+        "① 1 よくない 2 いい",
+        "② 1 混んでいる理由がわかった", "まったく：あきれ", "たり、怒ったりし", "たときに使う表現。",
+        "2 なぜ混んでいるのかわからない",
+        "③ 1 ダイエットはしていない", "あと（数量）=残り",
+        "2 ダイエットをしている",
+    ]
+    boxes = [
+        _box(40, 60, 400), _box(40, 120, 300),
+        _box(40, 180, 300), _box(460, 180, 120), _box(460, 202, 120), _box(460, 224, 120),
+        _box(60, 240, 300),
+        _box(40, 300, 300), _box(460, 300, 120),
+        _box(60, 360, 300),
+    ]
+    result = process_page_layout(txts, boxes, 600, 800, scores=[.98] * len(txts))
+    lines = result["clean_text"].splitlines()
+    assert result["columns_detected"] == 2
+    assert "② 1 混んでいる理由がわかった" in lines
+    assert "> まったく：あきれたり、怒ったりしたときに使う表現。" in lines
+    assert "> あと（数量）=残り" in lines
+    assert lines.index("2 ダイエットをしている") < lines.index("> まったく：あきれたり、怒ったりしたときに使う表現。")
+    assert result["clean_line_sources"][lines.index("> まったく：あきれたり、怒ったりしたときに使う表現。")] == [3, 4, 5]
+
+
+def test_katakana_lookalikes_in_hiragana_context_are_corrected():
+    cases = {
+        "リゅう": "りゅう",
+        "あリがとう": "ありがとう",
+        "学校ヘ行く": "学校へ行く",
+        "食ベる": "食べる",
+        "入ロはどこ": "入口はどこ",
+        "②1 わかりました": "② 1 わかりました",
+    }
+    for raw, expected in cases.items():
+        assert correct_homoglyphs_and_boundaries(raw)[0] == expected, raw
+    # Real katakana words are left alone.
+    for word in ("リンゴを食べる", "ヘルメット", "ユリが咲く", "ペンを使う", "ドロップ", "カレーライス"):
+        assert correct_homoglyphs_and_boundaries(word)[0] == word, word
+
+
+def test_ruby_under_bold_kanji_and_unreadable_noise_are_filtered():
+    txts = ["1 番", "ばん", "女の人の答えはどちらの意味ですか。", "30 929 30 229", "① 1 よくない 2 いい", "1"]
+    boxes = [_box(40, 100, 60, 34), _box(52, 136, 40, 16), _box(120, 105, 400), _box(40, 200, 300), _box(40, 260, 300), _box(40, 320, 20)]
+    result = process_page_layout(txts, boxes, 600, 800, scores=[.98, .7, .98, .57, .97, .72])
+    reasons = [line["filter_reason"] for line in result["source_lines"]]
+    assert reasons[1] == "furigana"
+    assert reasons[3] == "noise"
+    assert reasons[5] is None  # a short low-confidence answer digit is kept
+    assert "ばん" not in result["clean_text"] and "929" not in result["clean_text"]
+
+
+def test_dialogue_line_wrapped_at_right_margin_is_rejoined():
+    txts = ["問題Ⅱ スクリプト", "① 2 女：それからね、曲がって少し行ったところに、左にコンビニがあるんだけど、その", "先です。", "男：わかった。", "② 1 よくない 2 いい"]
+    boxes = [_box(40, 40, 200), _box(40, 100, 520), _box(120, 124, 80), _box(120, 160, 120), _box(40, 220, 200)]
+    result = process_page_layout(txts, boxes, 600, 800, scores=[.99] * len(txts))
+    lines = result["clean_text"].splitlines()
+    assert "① 2 女：それからね、曲がって少し行ったところに、左にコンビニがあるんだけど、その先です。" in lines
+    assert "男：わかった。" in lines  # a new speaker starts a new line
+    assert "② 1 よくない 2 いい" in lines
+
+
+def test_cd_track_number_is_merged_into_cd_label():
+    txts = ["こたえ スクリプト", "CD1", "58", "3 番 2 先生が、教室で説明しています。", "先生：月・水・金は、この教科書を使います。"]
+    boxes = [_box(150, 40, 200), _box(40, 100, 40, 18), _box(48, 122, 24, 18), _box(120, 100, 400), _box(120, 140, 400)]
+    result = process_page_layout(txts, boxes, 600, 800, scores=[.99] * len(txts))
+    assert "CD1-58 3 番 2 先生が、教室で説明しています。" in result["clean_text"].splitlines()
+    assert result["source_lines"][2]["filter_reason"] == "cd_track"
+
+
+def test_orphan_track_number_and_symbol_soup_are_dropped_but_blanks_kept():
+    txts = ["43", "2 番", "① ② ③ ④", ".   . .", "（　　）", "1 900 円"]
+    boxes = [_box(40, 100, 24), _box(80, 100, 60), _box(160, 100, 200), _box(40, 160, 200), _box(40, 220, 80), _box(40, 280, 120)]
+    result = process_page_layout(txts, boxes, 600, 800, scores=[.95] * len(txts))
+    lines = result["clean_text"].splitlines()
+    assert "2 番 ① ② ③ ④" in lines
+    assert ".   . ." not in result["clean_text"]
+    assert any("（　　）" in line for line in lines)
+    assert "1 900 円" in lines
+    assert result["source_lines"][0]["filter_reason"] == "cd_track"

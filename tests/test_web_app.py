@@ -72,6 +72,28 @@ def test_cancel_uses_durable_signal_without_losing_status(tmp_path):
     assert client.get(f"/api/jobs/{job['id']}").json()['status'] == 'cancelled'
 
 
+def test_worker_records_pipeline_import_failure(tmp_path, monkeypatch):
+    import builtins
+    from web_app import create_app
+
+    app = create_app(tmp_path, start_worker=False)
+    client = TestClient(app)
+    job = client.post('/api/jobs', files={'file': ('book.pdf', make_pdf(), 'application/pdf')}).json()
+    real_import = builtins.__import__
+
+    def import_without_numpy(name, *args, **kwargs):
+        if name == 'directml_pipeline':
+            raise ModuleNotFoundError("No module named 'numpy'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, '__import__', import_without_numpy)
+    app.state.jobs._run(job)
+
+    state = client.get(f"/api/jobs/{job['id']}").json()
+    assert state['status'] == 'failed'
+    assert state['message'] == "No module named 'numpy'"
+
+
 def test_hardware_endpoint_returns_observed_provider_list(tmp_path):
     from web_app import create_app
     client = TestClient(create_app(tmp_path, start_worker=False))
@@ -80,6 +102,9 @@ def test_hardware_endpoint_returns_observed_provider_list(tmp_path):
 
 def test_auto_falls_back_and_gpu_errors_when_session_lacks_directml(monkeypatch):
     import directml_pipeline as pipeline
+    def unavailable_cuda(**_):
+        raise RuntimeError('CUDA unavailable')
+    monkeypatch.setattr(pipeline, 'RapidOCRCUDABackend', unavailable_cuda)
     class FakeGpu:
         backend_actual = 'CPUExecutionProvider'
         provider_sets = [['CPUExecutionProvider']]
@@ -268,3 +293,122 @@ def test_toggle_page_review_and_preview_cache(tmp_path):
 
 
 
+
+
+def test_review_pending_is_emptied_after_last_pending_page_is_reviewed(tmp_path):
+    from web_app import create_app
+    app = create_app(tmp_path, start_worker=False)
+    service = app.state.jobs
+    job = TestClient(app).post('/api/jobs', files={'file': ('book.pdf', make_pdf(), 'application/pdf')}).json()
+    service._write_page_result(job['id'], {'page': 1, 'clean': '要確認', 'raw': '要確認', 'needs_review': True, 'review_reasons': ['low_confidence']})
+    service._reaggregate_outputs(job['id'])
+    pending = tmp_path / job['id'] / 'review_pending.md'
+    assert '要確認' in pending.read_text(encoding='utf-8')
+
+    service.review_page(job['id'], 1, True)
+
+    assert pending.read_text(encoding='utf-8') == ''
+    assert '要確認' in (tmp_path / job['id'] / 'clean_reviewed.md').read_text(encoding='utf-8')
+
+
+def test_blocking_page_endpoints_run_in_threadpool(tmp_path):
+    import inspect
+    from web_app import create_app
+    app = create_app(tmp_path, start_worker=False)
+    blocking = {'/api/jobs/{job_id}/pages/{page}/clean', '/api/jobs/{job_id}/pages/{page}/review', '/api/jobs/{job_id}/pages/{page}/rerun'}
+    endpoints = {route.path: route.endpoint for route in app.routes if getattr(route, 'path', None) in blocking}
+    assert set(endpoints) == blocking
+    assert not any(inspect.iscoroutinefunction(fn) for fn in endpoints.values())
+
+
+def test_cancel_signal_wins_even_if_cancel_flag_was_lost(tmp_path, monkeypatch):
+    import directml_pipeline
+    from web_app import create_app
+    app = create_app(tmp_path, start_worker=False)
+    service = app.state.jobs
+    job = TestClient(app).post('/api/jobs', files={'file': ('book.pdf', make_pdf(), 'application/pdf')}).json()
+
+    def stream(*args, **kwargs):
+        # Event set without cancel_requested reaching job.json: the old code left the job "running".
+        service.cancel_events[job['id']].set()
+        yield .3, '已取消', '', '', True, None
+    monkeypatch.setattr(directml_pipeline, 'process_pdf_gpu_adaptive_generator', stream)
+    service._run(service.get(job['id']))
+
+    assert service.get(job['id'])['status'] == 'cancelled'
+
+
+def test_generator_without_result_marks_job_failed(tmp_path, monkeypatch):
+    import directml_pipeline
+    from web_app import create_app
+    app = create_app(tmp_path, start_worker=False)
+    service = app.state.jobs
+    job = TestClient(app).post('/api/jobs', files={'file': ('book.pdf', make_pdf(), 'application/pdf')}).json()
+    monkeypatch.setattr(directml_pipeline, 'process_pdf_gpu_adaptive_generator', lambda *a, **k: iter([(1.0, 'x', '', '', True, None)]))
+    service._run(service.get(job['id']))
+    assert service.get(job['id'])['status'] == 'failed'
+
+
+def test_ocr_backend_is_loaded_once_and_reused(monkeypatch):
+    import directml_pipeline as pipeline
+    created = []
+    monkeypatch.setattr(pipeline, 'get_ocr_backend', lambda **kwargs: created.append(kwargs) or object())
+    first = pipeline.get_cached_ocr_backend('cpu')
+    second = pipeline.get_cached_ocr_backend('cpu')
+    assert first is second
+    assert len(created) == 1
+    assert pipeline.get_cached_ocr_backend('dml') is not first
+
+
+def test_edits_made_while_running_survive_completion(tmp_path, monkeypatch):
+    import directml_pipeline
+    from web_app import create_app
+    app = create_app(tmp_path, start_worker=False)
+    service = app.state.jobs
+    job = TestClient(app).post('/api/jobs', files={'file': ('book.pdf', make_pdf(), 'application/pdf')}, data={'range_mode': 'custom', 'start_page': '1', 'end_page': '1'}).json()
+
+    def stream(source, output, **kwargs):
+        output = Path(output)
+        kwargs['on_page']({'page': 1, 'clean': 'OCR 文字', 'raw': 'OCR 文字', 'needs_review': True})
+        service.update_page_clean(job['id'], 1, '使用者在辨識中修改')
+        md, raw, metrics, structured = output/'n.md', output/'n.txt', output/'n.json', output/'n.jsonl'
+        md.write_text('## Page 1\n\nOCR 文字\n', encoding='utf-8'); raw.write_text('x', encoding='utf-8')
+        metrics.write_text('{}', encoding='utf-8'); structured.write_text('{}\n', encoding='utf-8')
+        yield 1, '完成', '', '', True, {'md_path': md, 'raw_path': raw, 'metrics_path': metrics, 'structured_path': structured}
+    monkeypatch.setattr(directml_pipeline, 'process_pdf_gpu_adaptive_generator', stream)
+    service._run(service.get(job['id']))
+
+    assert service.get(job['id'])['status'] == 'completed'
+    assert '使用者在辨識中修改' in (tmp_path / job['id'] / 'clean.md').read_text(encoding='utf-8')
+
+
+def test_review_count_ignores_reviewed_pages_and_cache_refreshes(tmp_path):
+    from web_app import create_app
+    app = create_app(tmp_path, start_worker=False)
+    client = TestClient(app)
+    service = app.state.jobs
+    job = client.post('/api/jobs', files={'file': ('book.pdf', make_pdf(), 'application/pdf')}).json()
+    service._write_page_result(job['id'], {'page': 1, 'clean': 'a', 'needs_review': True})
+    service._write_page_result(job['id'], {'page': 2, 'clean': 'b', 'needs_review': True, 'reviewed': True})
+    assert client.get(f"/api/jobs/{job['id']}").json()['needs_review_count'] == 1
+    assert client.get(f"/api/jobs/{job['id']}/pages").json()[0]['reviewed'] is False
+    service.review_page(job['id'], 1, True)
+    assert client.get(f"/api/jobs/{job['id']}/pages").json()[0]['reviewed'] is True
+    assert client.get(f"/api/jobs/{job['id']}").json()['needs_review_count'] == 0
+
+
+def test_broken_job_folder_does_not_break_history_or_worker(tmp_path):
+    from web_app import create_app
+    (tmp_path / 'not-a-uuid').mkdir()
+    (tmp_path / 'not-a-uuid' / 'job.json').write_text('{broken', encoding='utf-8')
+    app = create_app(tmp_path, start_worker=False)
+    client = TestClient(app)
+    job = client.post('/api/jobs', files={'file': ('book.pdf', make_pdf(), 'application/pdf')}).json()
+    assert [j['id'] for j in client.get('/api/jobs').json()] == [job['id']]
+
+
+def test_rerun_rejects_page_outside_document(tmp_path):
+    from web_app import create_app
+    client = TestClient(create_app(tmp_path, start_worker=False))
+    job = client.post('/api/jobs', files={'file': ('book.pdf', make_pdf(), 'application/pdf')}).json()
+    assert client.post(f"/api/jobs/{job['id']}/pages/99/rerun", json={}).status_code == 404
